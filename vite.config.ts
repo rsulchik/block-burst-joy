@@ -5,7 +5,7 @@
 //     React/TanStack dedupe, error logger plugins, and sandbox detection (port/host/strictPort).
 // You can pass additional config via defineConfig({ vite: { ... }, etc... }) if needed.
 import { defineConfig } from "@lovable.dev/vite-tanstack-config";
-import { VitePWA } from 'vite-plugin-pwa';
+import { VitePWA } from "vite-plugin-pwa";
 
 // SPA shell нужен Capacitor (статический index.html без Node-сервера).
 const spaMode = {
@@ -25,62 +25,52 @@ export default defineConfig({
   vite: {
     plugins: [
       VitePWA({
-        registerType: 'autoUpdate',
-        includeAssets: ['favicon.ico', 'robots.txt', 'icon-192.svg', 'icon-512.svg'],
+        registerType: "autoUpdate",
+        injectRegister: null,
+        includeAssets: ["favicon.ico", "robots.txt", "icon-192.svg", "icon-512.svg"],
         manifest: {
-          name: 'Block Blast Joy',
-          short_name: 'Block Blast',
-          description: 'Мобильная игра-головоломка в стиле Block Blast',
-          theme_color: '#1a2030',
-          background_color: '#1a2030',
-          display: 'standalone',
-          orientation: 'portrait',
+          name: "Block Blast Joy",
+          short_name: "Block Blast",
+          description: "Мобильная игра-головоломка в стиле Block Blast",
+          theme_color: "#1a2030",
+          background_color: "#1a2030",
+          display: "standalone",
+          orientation: "portrait",
           icons: [
             {
-              src: '/icon-192.svg',
-              sizes: '192x192',
-              type: 'image/svg+xml',
-              purpose: 'any maskable'
+              src: "/icon-192.svg",
+              sizes: "192x192",
+              type: "image/svg+xml",
+              purpose: "any maskable",
             },
             {
-              src: '/icon-512.svg',
-              sizes: '512x512',
-              type: 'image/svg+xml',
-              purpose: 'any maskable'
-            }
-          ]
+              src: "/icon-512.svg",
+              sizes: "512x512",
+              type: "image/svg+xml",
+              purpose: "any maskable",
+            },
+          ],
         },
         workbox: {
-          globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'],
+          // TanStack Start places browser assets here rather than in Vite's default dist/.
+          globDirectory: ".output/public",
+          globPatterns: ["**/*.{js,css,html,ico,png,svg,woff2}"],
           runtimeCaching: [
             {
-              urlPattern: /^https:\/\/.*\.supabase\.co\/.*/i,
-              handler: 'NetworkFirst',
-              options: {
-                cacheName: 'supabase-api',
-                expiration: {
-                  maxEntries: 32,
-                  maxAgeSeconds: 24 * 60 * 60 // 24 hours
-                },
-                cacheableResponse: {
-                  statuses: [0, 200]
-                }
-              }
-            },
-            {
+              // Never cache authenticated Supabase responses in a shared service-worker cache.
               urlPattern: /\.(?:png|jpg|jpeg|svg|gif|webp)$/i,
-              handler: 'CacheFirst',
+              handler: "CacheFirst",
               options: {
-                cacheName: 'images',
+                cacheName: "images",
                 expiration: {
                   maxEntries: 60,
-                  maxAgeSeconds: 30 * 24 * 60 * 60 // 30 days
-                }
-              }
-            }
-          ]
-        }
-      })
-    ]
-  }
+                  maxAgeSeconds: 30 * 24 * 60 * 60,
+                },
+              },
+            },
+          ],
+        },
+      }),
+    ],
+  },
 });

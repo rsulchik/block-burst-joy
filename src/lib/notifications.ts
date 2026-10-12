@@ -1,10 +1,10 @@
-import { PushNotifications, Token } from '@capacitor/push-notifications';
-import { LocalNotifications } from '@capacitor/local-notifications';
-import { supabase } from './supabase';
+import { PushNotifications, Token } from "@capacitor/push-notifications";
+import { LocalNotifications } from "@capacitor/local-notifications";
+import { supabase } from "./supabase";
 
 // FCM requires android/app/google-services.json. Keep it opt-in so an APK
 // without that file never calls Firebase during startup and cannot crash.
-const pushNotificationsEnabled = import.meta.env['VITE_ENABLE_PUSH_NOTIFICATIONS'] === 'true';
+const pushNotificationsEnabled = import.meta.env["VITE_ENABLE_PUSH_NOTIFICATIONS"] === "true";
 let pushNotificationsInitialized = false;
 let dailyReminderScheduled = false;
 
@@ -27,33 +27,33 @@ export async function initPushNotifications(): Promise<void> {
   try {
     // Запрашиваем разрешение
     const result = await PushNotifications.requestPermissions();
-    if (result.receive === 'granted') {
+    if (result.receive === "granted") {
       // Регистрируем устройство
       await PushNotifications.register();
-      
+
       // Получаем токен
-      PushNotifications.addListener('registration', async (token: Token) => {
-        console.log('Push registration success, token: ' + token.value);
+      PushNotifications.addListener("registration", async (token: Token) => {
+        console.log("Push registration success, token: " + token.value);
         await savePushToken(token.value);
       });
 
       // Обработка ошибок регистрации
-      PushNotifications.addListener('registrationError', (error: any) => {
-        console.error('Error on registration: ' + JSON.stringify(error));
+      PushNotifications.addListener("registrationError", (error: unknown) => {
+        console.error("Error on registration: " + JSON.stringify(error));
       });
 
       // Обработка входящих уведомлений
-      PushNotifications.addListener('pushNotificationReceived', (notification) => {
-        console.log('Push notification received: ' + JSON.stringify(notification));
+      PushNotifications.addListener("pushNotificationReceived", (notification) => {
+        console.log("Push notification received: " + JSON.stringify(notification));
       });
 
       // Обработка нажатия на уведомление
-      PushNotifications.addListener('pushNotificationActionPerformed', (notification) => {
-        console.log('Push notification action performed: ' + JSON.stringify(notification));
+      PushNotifications.addListener("pushNotificationActionPerformed", (notification) => {
+        console.log("Push notification action performed: " + JSON.stringify(notification));
       });
     }
   } catch (error) {
-    console.error('Error initializing push notifications:', error);
+    console.error("Error initializing push notifications:", error);
   }
 }
 
@@ -62,19 +62,19 @@ export async function initPushNotifications(): Promise<void> {
  */
 async function savePushToken(token: string): Promise<void> {
   try {
-    const { data: { user } } = await supabase.auth.getUser();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
     if (!user) return;
 
-    await supabase
-      .from('user_devices')
-      .upsert({
-        user_id: user.id,
-        push_token: token,
-        platform: 'android',
-        updated_at: new Date().toISOString()
-      });
+    await supabase.from("user_devices").upsert({
+      user_id: user.id,
+      push_token: token,
+      platform: "android",
+      updated_at: new Date().toISOString(),
+    });
   } catch (error) {
-    console.error('Error saving push token:', error);
+    console.error("Error saving push token:", error);
   }
 }
 
@@ -88,10 +88,10 @@ export async function scheduleDailyReminder(): Promise<void> {
   try {
     // Проверяем разрешение
     const permission = await LocalNotifications.checkPermissions();
-    if (permission.display !== 'granted') {
+    if (permission.display !== "granted") {
       const result = await LocalNotifications.requestPermissions();
-      if (result.display !== 'granted') {
-        console.log('Local notifications permission not granted');
+      if (result.display !== "granted") {
+        console.log("Local notifications permission not granted");
         return;
       }
     }
@@ -112,24 +112,24 @@ export async function scheduleDailyReminder(): Promise<void> {
       notifications: [
         {
           id: 1,
-          title: 'Block Blast - Ежедневное задание!',
-          body: 'Не забудьте выполнить сегодняшнее задание и получить бонусные очки!',
+          title: "Block Blast - Ежедневное задание!",
+          body: "Не забудьте выполнить сегодняшнее задание и получить бонусные очки!",
           schedule: {
             at: notificationTime,
             allowWhileIdle: true,
             repeats: true,
           },
-          sound: 'default',
-          smallIcon: 'ic_stat_block_blast',
-          iconColor: '#3b82f6',
+          sound: "default",
+          smallIcon: "ic_stat_block_blast",
+          iconColor: "#3b82f6",
         },
       ],
     });
 
-    console.log('Daily reminder scheduled for:', notificationTime);
+    console.log("Daily reminder scheduled for:", notificationTime);
   } catch (error) {
     dailyReminderScheduled = false;
-    console.error('Error scheduling daily reminder:', error);
+    console.error("Error scheduling daily reminder:", error);
   }
 }
 
@@ -144,14 +144,14 @@ export async function sendAchievementNotification(title: string, body: string): 
           id: Date.now(),
           title,
           body,
-          sound: 'default',
-          smallIcon: 'ic_stat_block_blast',
-          iconColor: '#10b981',
+          sound: "default",
+          smallIcon: "ic_stat_block_blast",
+          iconColor: "#10b981",
         },
       ],
     });
   } catch (error) {
-    console.error('Error sending achievement notification:', error);
+    console.error("Error sending achievement notification:", error);
   }
 }
 
@@ -160,46 +160,44 @@ export async function sendAchievementNotification(title: string, body: string): 
  */
 export async function getTodayTask(): Promise<DailyTask | null> {
   try {
-    const { data, error } = await supabase
-      .rpc('get_daily_task');
+    const { data, error } = await supabase.rpc("get_daily_task");
 
     if (error) throw error;
-    return Array.isArray(data) ? data[0] ?? null : data;
+    return Array.isArray(data) ? (data[0] ?? null) : data;
   } catch (error) {
-    console.error('Error getting today task:', error);
+    console.error("Error getting today task:", error);
     return null;
   }
 }
 
-/**
- * Claims a task reward on the server. A duplicate completion returns 0.
- */
-export async function completeTask(taskId: string): Promise<number | null> {
+export async function hasCompletedDailyTask(taskId: string): Promise<boolean> {
   try {
-    const { data, error } = await supabase.rpc('claim_daily_task_reward', {
-      p_task_id: taskId,
-    });
+    const { data, error } = await supabase
+      .from("task_completions")
+      .select("id")
+      .eq("task_id", taskId)
+      .maybeSingle();
 
     if (error) throw error;
-    return typeof data === 'number' ? data : null;
+    return data !== null;
   } catch (error) {
-    console.error('Error completing task:', error);
-    return null;
+    console.error("Error checking daily task status:", error);
+    return false;
   }
 }
 
-export async function getWalletBalance(userId: string): Promise<number> {
+export async function getWalletBalance(userId: string): Promise<number | null> {
   try {
     const { data, error } = await supabase
-      .from('profiles')
-      .select('wallet_points')
-      .eq('id', userId)
+      .from("profiles")
+      .select("wallet_points")
+      .eq("id", userId)
       .single();
 
     if (error) throw error;
-    return typeof data.wallet_points === 'number' ? data.wallet_points : 0;
+    return typeof data.wallet_points === "number" ? data.wallet_points : 0;
   } catch (error) {
-    console.error('Error loading wallet balance:', error);
-    return 0;
+    console.error("Error loading wallet balance:", error);
+    return null;
   }
 }

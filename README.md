@@ -79,6 +79,16 @@ Prefer working locally? You need Node.js and npm — [install with nvm](https://
 ```sh
 git clone <this-repository-url>
 cd <repository-name>
-npm i
+npm ci
 npm run dev
 ```
+
+Run the verification checks and production PWA build with:
+
+```sh
+npm run typecheck
+npm test
+npm run build
+```
+
+Supabase migrations, verified-run Edge Function deployment, and required auth configuration are documented in [`SUPABASE_SETUP.md`](./SUPABASE_SETUP.md).

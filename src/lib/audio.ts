@@ -30,7 +30,9 @@ export function setSoundOn(on: boolean) {
 function ac(): AudioContext | null {
   if (typeof window === "undefined") return null;
   if (!ctx) {
-    const Ctor = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    const Ctor =
+      window.AudioContext ??
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
     if (!Ctor) return null;
     ctx = new Ctor();
     master = ctx.createGain();
@@ -192,11 +194,26 @@ export function startMenuMusic() {
   const playLoop = () => {
     let t = 0;
     MELODY.forEach(([f, d]) => {
-      if (f) tone({ freq: f, dur: d * beat * 0.85, type: "triangle", gain: 0.07, delay: t, dest: musicGain! });
+      if (f)
+        tone({
+          freq: f,
+          dur: d * beat * 0.85,
+          type: "triangle",
+          gain: 0.07,
+          delay: t,
+          dest: musicGain!,
+        });
       t += d * beat;
     });
     BASS.forEach((f, i) =>
-      tone({ freq: f, dur: beat * 0.9, type: "sine", gain: 0.06, delay: i * beat, dest: musicGain! }),
+      tone({
+        freq: f,
+        dur: beat * 0.9,
+        type: "sine",
+        gain: 0.06,
+        delay: i * beat,
+        dest: musicGain!,
+      }),
     );
     BASS.forEach((f, i) =>
       tone({

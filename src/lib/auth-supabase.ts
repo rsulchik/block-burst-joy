@@ -1,4 +1,4 @@
-import { supabase } from './supabase';
+import { supabase } from "./supabase";
 
 export type AuthUser = {
   id: string;
@@ -53,7 +53,10 @@ export function referralLinkFor(userId: string): string {
     window.location.hostname !== "localhost"
       ? window.location.origin
       : "";
-  const baseUrl = (configuredBaseUrl || browserBaseUrl || "https://blockblast.app").replace(/\/+$/, "");
+  const baseUrl = (configuredBaseUrl || browserBaseUrl || "https://blockblast.app").replace(
+    /\/+$/,
+    "",
+  );
 
   return `${baseUrl}/?ref=${referralCodeForUser(userId)}`;
 }
@@ -90,7 +93,7 @@ export async function register(
   if (normalized.length < 10 || normalized.length > 15) {
     return { ok: false, error: "Введите корректный номер телефона" };
   }
-  if (password.length < 4) return { ok: false, error: "Пароль — минимум 4 символа" };
+  if (password.length < 8) return { ok: false, error: "Пароль — минимум 8 символов" };
   if (referralInput.trim() && !referralCode) {
     return { ok: false, error: "Введите корректную реферальную ссылку или код" };
   }
@@ -125,7 +128,7 @@ export async function register(
   });
 
   if (error) {
-    if (error.message.includes('User already registered')) {
+    if (error.message.includes("User already registered")) {
       return { ok: false, error: "Этот номер уже зарегистрирован" };
     }
     return { ok: false, error: error.message };
@@ -134,35 +137,22 @@ export async function register(
   if (!data.user) {
     return { ok: false, error: "Ошибка регистрации" };
   }
+  if (!data.session) {
+    return {
+      ok: false,
+      error:
+        "Supabase не создал сессию. Отключите подтверждение email для внутреннего адреса или настройте проверку телефона.",
+    };
+  }
 
-  // Создаём профиль в таблице profiles
-  const { error: profileError } = await supabase
-    .from('profiles')
-    .insert({
+  // The database trigger creates the profile and applies a valid referral code.
+  return {
+    ok: true,
+    user: {
       id: data.user.id,
       name: trimmedName,
       phone: normalized,
-      referral_code: referralCodeForUser(data.user.id),
-    });
-
-  if (profileError && profileError.code !== "23505") {
-    console.error('Profile creation error:', profileError);
-  }
-
-  if (referralCode && data.session) {
-    const { error: referralError } = await supabase.rpc("apply_referral_code", {
-      p_referral_code: referralCode,
-    });
-    if (referralError) console.error("Referral application error:", referralError);
-  }
-
-  return { 
-    ok: true, 
-    user: { 
-      id: data.user.id, 
-      name: trimmedName, 
-      phone: normalized 
-    } 
+    },
   };
 }
 
@@ -179,7 +169,7 @@ export async function login(phone: string, password: string): Promise<AuthResult
   });
 
   if (error) {
-    if (error.message === 'Invalid login credentials') {
+    if (error.message === "Invalid login credentials") {
       return { ok: false, error: "Неверный пароль" };
     }
     return { ok: false, error: error.message };
@@ -191,28 +181,30 @@ export async function login(phone: string, password: string): Promise<AuthResult
 
   // Получаем данные профиля
   const { data: profile, error: profileError } = await supabase
-    .from('profiles')
-    .select('name, phone')
-    .eq('id', data.user.id)
+    .from("profiles")
+    .select("name, phone")
+    .eq("id", data.user.id)
     .single();
 
   if (profileError || !profile) {
     return { ok: false, error: "Ошибка загрузки профиля" };
   }
 
-  return { 
-    ok: true, 
-    user: { 
-      id: data.user.id, 
-      name: profile.name, 
-      phone: profile.phone 
-    } 
+  return {
+    ok: true,
+    user: {
+      id: data.user.id,
+      name: profile.name,
+      phone: profile.phone,
+    },
   };
 }
 
 export async function getSessionUser(): Promise<AuthUser | null> {
-  const { data: { session } } = await supabase.auth.getSession();
-  
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+
   if (!session?.user) return null;
 
   const metadata = session.user.user_metadata as { name?: unknown; phone?: unknown };
@@ -229,9 +221,9 @@ export async function getSessionUser(): Promise<AuthUser | null> {
   if (typeof navigator !== "undefined" && !navigator.onLine) return cachedUser;
 
   const { data: profile } = await supabase
-    .from('profiles')
-    .select('name, phone')
-    .eq('id', session.user.id)
+    .from("profiles")
+    .select("name, phone")
+    .eq("id", session.user.id)
     .single();
 
   if (!profile) return cachedUser;
@@ -243,8 +235,9 @@ export async function getSessionUser(): Promise<AuthUser | null> {
   };
 }
 
-export async function logout() {
-  await supabase.auth.signOut();
+export async function logout(): Promise<void> {
+  const { error } = await supabase.auth.signOut();
+  if (error) throw error;
 }
 
 export function bestKeyFor(userId: string) {
