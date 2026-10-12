@@ -9,7 +9,7 @@ type Props = {
 
 export default function AuthScreen({ onAuth }: Props) {
   const initialReferralCode =
-    typeof window === "undefined" ? "" : extractReferralCode(window.location.href) ?? "";
+    typeof window === "undefined" ? "" : (extractReferralCode(window.location.href) ?? "");
   const [mode, setMode] = useState<Mode>(initialReferralCode ? "register" : "login");
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
@@ -50,6 +50,9 @@ export default function AuthScreen({ onAuth }: Props) {
         return;
       }
       onAuth(res.user);
+    } catch (error) {
+      console.error("Authentication request failed:", error);
+      setError("Häzirki wagtda girip bolmady. Internet birikmesini barlap, täzeden synanyşyň.");
     } finally {
       setBusy(false);
     }
@@ -120,11 +123,11 @@ export default function AuthScreen({ onAuth }: Props) {
             className="auth-input"
             type="password"
             autoComplete={mode === "login" ? "current-password" : "new-password"}
-            placeholder="iň azyndan 4 simwol"
+            placeholder="iň azyndan 8 simwol"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             required
-            minLength={4}
+            minLength={8}
           />
         </label>
 
@@ -139,7 +142,7 @@ export default function AuthScreen({ onAuth }: Props) {
               value={password2}
               onChange={(e) => setPassword2(e.target.value)}
               required
-              minLength={4}
+              minLength={8}
             />
           </label>
         )}
@@ -159,7 +162,11 @@ export default function AuthScreen({ onAuth }: Props) {
           </label>
         )}
 
-        {error && <p className="auth-error">{error}</p>}
+        {error && (
+          <p className="auth-error" role="alert">
+            {error}
+          </p>
+        )}
 
         <button className="btn-primary btn-pulse mt-4 w-full" type="submit" disabled={busy}>
           {busy ? "Garaşýaň…" : mode === "login" ? "Girmek" : "Registrilenmek"}
@@ -167,7 +174,7 @@ export default function AuthScreen({ onAuth }: Props) {
       </form>
 
       <p className="mx-auto mt-auto max-w-xs pt-10 text-center text-xs leading-relaxed text-muted-foreground">
-        Made with ❤ by Resul Sopyyev 
+        Made with ❤ by Resul Sopyyev
       </p>
     </div>
   );

@@ -8,8 +8,9 @@ DROP TRIGGER IF EXISTS best_scores_updated_at ON public.best_scores;
 DROP FUNCTION IF EXISTS public.handle_new_user();
 DROP FUNCTION IF EXISTS public.handle_updated_at();
 
--- Удаляем существующие политики
+-- Replace policies by name without exposing profiles or leaderboard rows.
 DROP POLICY IF EXISTS "Users can view own profile" ON public.profiles;
+DROP POLICY IF EXISTS "Users can view all profiles" ON public.profiles;
 DROP POLICY IF EXISTS "Users can insert own profile" ON public.profiles;
 DROP POLICY IF EXISTS "Users can update own profile" ON public.profiles;
 DROP POLICY IF EXISTS "Users can view own save" ON public.game_saves;
@@ -17,15 +18,13 @@ DROP POLICY IF EXISTS "Users can insert own save" ON public.game_saves;
 DROP POLICY IF EXISTS "Users can update own save" ON public.game_saves;
 DROP POLICY IF EXISTS "Users can delete own save" ON public.game_saves;
 DROP POLICY IF EXISTS "Users can view own best score" ON public.best_scores;
+DROP POLICY IF EXISTS "Users can view all best scores" ON public.best_scores;
 DROP POLICY IF EXISTS "Users can insert own best score" ON public.best_scores;
 DROP POLICY IF EXISTS "Users can update own best score" ON public.best_scores;
 
--- Удаляем существующие таблицы
-DROP TABLE IF EXISTS public.best_scores;
-DROP TABLE IF EXISTS public.game_saves;
-DROP TABLE IF EXISTS public.profiles;
-
--- Теперь создаём всё заново (из 001_initial_schema.sql)
+-- This migration used to drop and recreate the core tables. Keep it additive:
+-- production databases may already contain player profiles, saves, and scores.
+-- Never put destructive table resets in the normal migration chain.
 
 -- Создаём таблицу профилей пользователей (дополнение к auth.users)
 CREATE TABLE IF NOT EXISTS public.profiles (
@@ -63,9 +62,9 @@ ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.game_saves ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.best_scores ENABLE ROW LEVEL SECURITY;
 
--- Политики для profiles
-CREATE POLICY "Users can view all profiles" ON public.profiles
-  FOR SELECT USING (true);
+-- Profiles are private; the public leaderboard is served by a column-safe RPC.
+CREATE POLICY "Users can view own profile" ON public.profiles
+  FOR SELECT USING (auth.uid() = id);
 
 CREATE POLICY "Users can insert own profile" ON public.profiles
   FOR INSERT WITH CHECK (auth.uid() = id);
@@ -86,9 +85,9 @@ CREATE POLICY "Users can update own save" ON public.game_saves
 CREATE POLICY "Users can delete own save" ON public.game_saves
   FOR DELETE USING (auth.uid() = user_id);
 
--- Политики для best_scores
-CREATE POLICY "Users can view all best scores" ON public.best_scores
-  FOR SELECT USING (true);
+-- Scores are private; use the leaderboard RPC for public display.
+CREATE POLICY "Users can view own best score" ON public.best_scores
+  FOR SELECT USING (auth.uid() = user_id);
 
 CREATE POLICY "Users can insert own best score" ON public.best_scores
   FOR INSERT WITH CHECK (auth.uid() = user_id);

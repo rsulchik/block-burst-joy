@@ -1,4 +1,5 @@
-import { supabase } from './supabase';
+import { supabase } from "./supabase";
+import type { GameMove } from "./verify-game-run.ts";
 
 export type SerializedPiece = {
   id: string;
@@ -12,10 +13,18 @@ export type SerializedPiece = {
 
 export type Board = (number | null)[][];
 
+export type SavedGameRun = {
+  runId: string;
+  seed: string;
+  randomState: number;
+  moves: GameMove[];
+};
+
 export type SaveData = {
   board: Board;
   pieces: (SerializedPiece | null)[];
   score: number;
+  gameRun?: SavedGameRun | null;
 };
 
 type LocalGameRecord = {
@@ -28,6 +37,26 @@ const LOCAL_DELETE_PREFIX = "blockblast.game-delete.v1:";
 const LOCAL_BEST_PREFIX = "blockblast.best.v1:";
 const BOARD_SIZE = 8;
 const REMOTE_LOAD_TIMEOUT_MS = 3500;
+const remoteOperationTails = new Map<string, Promise<void>>();
+const pendingRemoteSaves = new Map<
+  string,
+  { data: SaveData; updatedAt: number; operationId: number }
+>();
+let remoteSaveOperationId = 0;
+
+function enqueueRemoteOperation<T>(userId: string, operation: () => Promise<T>): Promise<T> {
+  const previous = remoteOperationTails.get(userId) ?? Promise.resolve();
+  const result = previous.catch(() => undefined).then(operation);
+  const tail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  remoteOperationTails.set(userId, tail);
+  void tail.then(() => {
+    if (remoteOperationTails.get(userId) === tail) remoteOperationTails.delete(userId);
+  });
+  return result;
+}
 
 function saveKey(userId: string) {
   return `${LOCAL_SAVE_PREFIX}${userId}`;
@@ -55,7 +84,10 @@ function isValidPiece(value: unknown): value is SerializedPiece {
   const shape = piece.shape;
   if (
     typeof piece.id !== "string" ||
+    typeof piece.color !== "number" ||
     !Number.isInteger(piece.color) ||
+    piece.color < 0 ||
+    piece.color >= 9 ||
     !shape ||
     typeof shape !== "object" ||
     !Number.isInteger(shape.w) ||
@@ -84,10 +116,38 @@ function isValidPiece(value: unknown): value is SerializedPiece {
   );
 }
 
+function isValidRunState(value: unknown): value is SavedGameRun | null | undefined {
+  if (value === undefined || value === null) return true;
+  if (typeof value !== "object") return false;
+  const run = value as Partial<SavedGameRun>;
+  return (
+    typeof run.runId === "string" &&
+    typeof run.seed === "string" &&
+    Number.isInteger(run.randomState) &&
+    Array.isArray(run.moves) &&
+    run.moves.length <= 5000 &&
+    run.moves.every(
+      (move) =>
+        !!move &&
+        Number.isInteger(move.slot) &&
+        move.slot >= 0 &&
+        move.slot < 3 &&
+        Number.isInteger(move.row) &&
+        Number.isInteger(move.col),
+    )
+  );
+}
+
 function isValidSaveData(value: unknown): value is SaveData {
   if (!value || typeof value !== "object") return false;
   const save = value as Partial<SaveData>;
-  if (!Number.isFinite(save.score) || (save.score ?? 0) < 0 || !Array.isArray(save.board) || !Array.isArray(save.pieces)) {
+  if (
+    !Number.isSafeInteger(save.score) ||
+    (save.score ?? 0) < 0 ||
+    !Array.isArray(save.board) ||
+    !Array.isArray(save.pieces) ||
+    !isValidRunState(save.gameRun)
+  ) {
     return false;
   }
 
@@ -97,10 +157,14 @@ function isValidSaveData(value: unknown): value is SaveData {
       (row) =>
         Array.isArray(row) &&
         row.length === BOARD_SIZE &&
-        row.every((cell) => cell === null || (Number.isInteger(cell) && cell >= 0 && cell <= 9)),
+        row.every((cell) => cell === null || (Number.isInteger(cell) && cell >= 0 && cell < 9)),
     );
 
-  return validBoard && save.pieces.length === 3 && save.pieces.every((piece) => piece === null || isValidPiece(piece));
+  return (
+    validBoard &&
+    save.pieces.length === 3 &&
+    save.pieces.every((piece) => piece === null || isValidPiece(piece))
+  );
 }
 
 async function withTimeout<T>(request: PromiseLike<T>): Promise<T | null> {
@@ -126,7 +190,11 @@ function loadLocalGame(userId: string): LocalGameRecord | null {
     const raw = window.localStorage.getItem(saveKey(userId));
     if (!raw) return null;
     const record = JSON.parse(raw) as LocalGameRecord;
-    if (!isValidSaveData(record.data)) {
+    if (
+      !isValidSaveData(record.data) ||
+      !Number.isFinite(record.updatedAt) ||
+      record.updatedAt < 0
+    ) {
       window.localStorage.removeItem(saveKey(userId));
       return null;
     }
@@ -136,11 +204,11 @@ function loadLocalGame(userId: string): LocalGameRecord | null {
   }
 }
 
-function saveLocalGame(userId: string, data: SaveData) {
+function saveLocalGame(userId: string, data: SaveData, updatedAt = Date.now()) {
   if (!canUseLocalStorage()) return false;
 
   try {
-    const record: LocalGameRecord = { data, updatedAt: Date.now() };
+    const record: LocalGameRecord = { data, updatedAt };
     window.localStorage.setItem(saveKey(userId), JSON.stringify(record));
     window.localStorage.removeItem(deleteKey(userId));
     return true;
@@ -205,75 +273,122 @@ function saveLocalBestScore(userId: string, score: number) {
   }
 }
 
-async function saveRemoteGame(userId: string, data: SaveData): Promise<boolean> {
-  const { error } = await supabase
-    .from('game_saves')
-    .upsert({
-      user_id: userId,
-      board: data.board,
-      pieces: data.pieces,
-      score: data.score,
-    }, {
-      onConflict: 'user_id',
+type RemoteGameRecord = {
+  data: SaveData;
+  updatedAt: number;
+};
+
+async function readRemoteGame(userId: string): Promise<RemoteGameRecord | null | undefined> {
+  const response = await withTimeout(
+    supabase
+      .from("game_saves")
+      .select("board, pieces, score, run_state, client_updated_at, updated_at")
+      .eq("user_id", userId)
+      .maybeSingle(),
+  );
+  if (!response) return undefined;
+  if (response.error) return undefined;
+  if (!response.data) return null;
+
+  const data: SaveData = {
+    board: response.data.board as Board,
+    pieces: response.data.pieces as (SerializedPiece | null)[],
+    score: response.data.score,
+    gameRun: (response.data.run_state as SavedGameRun | null) ?? null,
+  };
+  const remoteTime = Date.parse(response.data.client_updated_at ?? response.data.updated_at);
+  if (!isValidSaveData(data) || !Number.isFinite(remoteTime)) return undefined;
+  return { data, updatedAt: remoteTime };
+}
+
+async function saveRemoteGame(userId: string, data: SaveData, updatedAt: number): Promise<boolean> {
+  try {
+    const { data: accepted, error } = await supabase.rpc("save_game_state", {
+      p_board: data.board,
+      p_pieces: data.pieces,
+      p_score: data.score,
+      p_run_state: data.gameRun ?? null,
+      p_client_updated_at: new Date(updatedAt).toISOString(),
     });
 
-  if (error) {
-    console.error('Save error:', error);
+    if (error) {
+      console.error("Save error:", error);
+      return false;
+    }
+    return accepted === true;
+  } catch (error) {
+    console.error("Save request failed:", error);
     return false;
   }
-  return true;
+}
+
+function queueRemoteSave(userId: string, data: SaveData, updatedAt: number): Promise<boolean> {
+  const operationId = ++remoteSaveOperationId;
+  pendingRemoteSaves.set(userId, { data, updatedAt, operationId });
+
+  // Coalesce queued progress updates without moving a post-delete save ahead of the delete.
+  return enqueueRemoteOperation(userId, async () => {
+    const latest = pendingRemoteSaves.get(userId);
+    if (!latest || latest.operationId > operationId) return true;
+    pendingRemoteSaves.delete(userId);
+    return saveRemoteGame(userId, latest.data, latest.updatedAt);
+  });
 }
 
 export async function saveGame(userId: string, data: SaveData): Promise<boolean> {
-  const savedLocally = saveLocalGame(userId, data);
+  const previous = loadLocalGame(userId);
+  const updatedAt = Math.max(Date.now(), (previous?.updatedAt ?? 0) + 1);
+  const savedLocally = saveLocalGame(userId, data, updatedAt);
   if (!isOnline()) return savedLocally;
 
-  const savedRemotely = await saveRemoteGame(userId, data);
+  const savedRemotely = await queueRemoteSave(userId, data, updatedAt);
   return savedLocally || savedRemotely;
 }
 
 export async function loadGame(userId: string): Promise<SaveData | null> {
+  if (hasPendingLocalDeletion(userId)) return null;
   const local = loadLocalGame(userId);
-  if (local) return local.data;
-  if (!isOnline() || hasPendingLocalDeletion(userId)) return null;
+  if (!isOnline()) return local?.data ?? null;
 
-  const response = await withTimeout(
-    supabase
-      .from('game_saves')
-      .select('board, pieces, score')
-      .eq('user_id', userId)
-      .single(),
-  );
-
-  if (!response || response.error || !response.data) {
-    return null;
+  const remote = await readRemoteGame(userId);
+  if (remote === undefined) return local?.data ?? null;
+  if (remote === null) {
+    if (local) {
+      void queueRemoteSave(userId, local.data, local.updatedAt);
+    }
+    return local?.data ?? null;
   }
 
-  const game = {
-    board: response.data.board as Board,
-    pieces: response.data.pieces as (SerializedPiece | null)[],
-    score: response.data.score,
-  };
+  if (local && local.updatedAt > remote.updatedAt) {
+    void queueRemoteSave(userId, local.data, local.updatedAt);
+    return local.data;
+  }
 
-  if (!isValidSaveData(game)) return null;
+  saveLocalGame(userId, remote.data, remote.updatedAt);
+  return remote.data;
+}
 
-  saveLocalGame(userId, game);
-  return game;
+async function deleteRemoteGame(userId: string): Promise<boolean> {
+  try {
+    const { error } = await supabase.from("game_saves").delete().eq("user_id", userId);
+
+    if (error) {
+      console.error("Clear save error:", error);
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.error("Clear save request failed:", error);
+    return false;
+  }
 }
 
 export async function clearSave(userId: string): Promise<boolean> {
   markLocalGameDeleted(userId);
   if (!isOnline()) return true;
 
-  const { error } = await supabase
-    .from('game_saves')
-    .delete()
-    .eq('user_id', userId);
-
-  if (error) {
-    console.error('Clear save error:', error);
-    return false;
-  }
+  const deleted = await enqueueRemoteOperation(userId, () => deleteRemoteGame(userId));
+  if (!deleted) return false;
   clearPendingLocalDeletion(userId);
   return true;
 }
@@ -283,66 +398,52 @@ export async function syncGame(userId: string): Promise<boolean> {
   if (!isOnline()) return false;
 
   if (hasPendingLocalDeletion(userId)) {
-    const { error } = await supabase
-      .from('game_saves')
-      .delete()
-      .eq('user_id', userId);
-
-    if (error) return false;
+    const deleted = await enqueueRemoteOperation(userId, () => deleteRemoteGame(userId));
+    if (!deleted) return false;
     clearPendingLocalDeletion(userId);
     return true;
   }
 
   const local = loadLocalGame(userId);
-  if (!local) return true;
-  return saveRemoteGame(userId, local.data);
+  const remote = await readRemoteGame(userId);
+  if (remote === undefined) return false;
+  if (!local) {
+    if (remote) saveLocalGame(userId, remote.data, remote.updatedAt);
+    return true;
+  }
+  if (!remote || local.updatedAt > remote.updatedAt) {
+    return queueRemoteSave(userId, local.data, local.updatedAt);
+  }
+
+  saveLocalGame(userId, remote.data, remote.updatedAt);
+  return true;
 }
 
-export async function saveBestScore(userId: string, score: number): Promise<boolean> {
-  const savedLocally = saveLocalBestScore(userId, score);
-  if (!isOnline()) return savedLocally;
-
-  const { error } = await supabase
-    .from('best_scores')
-    .upsert({
-      user_id: userId,
-      score,
-    }, {
-      onConflict: 'user_id',
-    });
-
-  if (error) {
-    console.error('Save best score error:', error);
-    return false;
-  }
-  return savedLocally || !error;
+/** Best scores are local until the server verifies a complete replay. */
+export function saveBestScore(userId: string, score: number): boolean {
+  return saveLocalBestScore(userId, score);
 }
 
 export async function loadBestScore(userId: string): Promise<number> {
-  const localScore = loadLocalBestScore(userId);
-  if (localScore !== null) return localScore;
-  if (!isOnline()) return 0;
+  const localScore = loadLocalBestScore(userId) ?? 0;
+  if (!isOnline()) return localScore;
 
   const response = await withTimeout(
-    supabase
-      .from('best_scores')
-      .select('score')
-      .eq('user_id', userId)
-      .single(),
+    supabase.from("best_scores").select("score").eq("user_id", userId).maybeSingle(),
   );
-
-  if (!response || response.error || !response.data || !Number.isFinite(response.data.score) || response.data.score < 0) {
-    return 0;
+  const remoteScore = response?.data?.score;
+  if (
+    response?.error ||
+    typeof remoteScore !== "number" ||
+    !Number.isSafeInteger(remoteScore) ||
+    remoteScore < 0
+  ) {
+    return localScore;
   }
-  saveLocalBestScore(userId, response.data.score);
-  return response.data.score;
-}
 
-/** Synchronizes locally cached best score when connectivity returns. */
-export async function syncBestScore(userId: string): Promise<boolean> {
-  const score = loadLocalBestScore(userId);
-  if (score === null || !isOnline()) return false;
-  return saveBestScore(userId, score);
+  const bestScore = Math.max(localScore, remoteScore);
+  saveLocalBestScore(userId, bestScore);
+  return bestScore;
 }
 
 export type LeaderboardEntry = {
@@ -350,23 +451,24 @@ export type LeaderboardEntry = {
   score: number;
 };
 
-export async function getLeaderboard(limit: number = 50): Promise<LeaderboardEntry[]> {
-  // Прямой запрос с LEFT JOIN через Supabase
-  const { data, error } = await supabase.rpc('get_leaderboard', {
-    limit_count: limit,
+export async function getLeaderboard(limit = 50): Promise<LeaderboardEntry[]> {
+  const safeLimit = Math.max(1, Math.min(100, Math.trunc(limit)));
+  const { data, error } = await supabase.rpc("get_leaderboard", {
+    limit_count: safeLimit,
   });
 
   if (error) {
-    console.error('Leaderboard error:', error);
+    console.error("Leaderboard error:", error);
     return [];
   }
+  if (!Array.isArray(data)) return [];
 
-  if (!data) {
-    return [];
-  }
-
-  return data.map((entry: any) => ({
-    name: entry.name || 'Unknown',
-    score: entry.score,
-  }));
+  return (data as unknown[]).flatMap((entry) => {
+    if (!entry || typeof entry !== "object") return [];
+    const row = entry as Record<string, unknown>;
+    const score = row["score"];
+    const name = row["name"];
+    if (typeof score !== "number" || !Number.isSafeInteger(score) || score < 0) return [];
+    return [{ name: typeof name === "string" ? name : "Unknown", score }];
+  });
 }

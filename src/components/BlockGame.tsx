@@ -1,12 +1,14 @@
-import { memo, useCallback, useEffect, useRef, useState, forwardRef } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, forwardRef } from "react";
 import {
   SIZE,
   type Board,
   type Piece,
   type Shape,
+  type RandomSource,
   applyClears,
   canPlace,
   clearScore,
+  createSeededRandom,
   difficultyFromScore,
   emptyBoard,
   findClears,
@@ -46,7 +48,6 @@ import {
   clearSave as clearGameSave,
   saveBestScore,
   loadBestScore,
-  syncBestScore,
   syncGame,
   getLeaderboard,
   type LeaderboardEntry,
@@ -56,13 +57,17 @@ import {
   scheduleDailyReminder,
   sendAchievementNotification,
   getTodayTask,
-  completeTask,
   getWalletBalance,
+  hasCompletedDailyTask,
   type DailyTask,
 } from "@/lib/notifications";
 import { usePWAInstall } from "@/hooks/usePWAInstall";
 import AuthScreen from "@/components/AuthScreen";
 import { prepareStartAd, showStartAd } from "@/lib/ads";
+import { supabase } from "@/lib/supabase";
+import { startVerifiedGameRun, submitVerifiedGameRun } from "@/lib/verified-runs";
+import type { StartedGameRun } from "@/lib/verified-runs";
+import type { SavedGameRun } from "@/lib/storage-supabase";
 
 const TUTORIAL_KEY = "blockblast_tutorial";
 /** Matches `.board-frame` padding (`p-2` = 8px). */
@@ -92,11 +97,36 @@ type GameTheme = "classic" | "sunset" | "ocean" | "neon";
 
 const GAME_THEME_KEY = "blockblast_game_theme";
 const PROFILE_STATS_PREFIX = "blockblast.profile.v1:";
-const GAME_THEMES: { id: GameTheme; name: string; description: string; colors: [string, string, string] }[] = [
-  { id: "classic", name: "Klassik", description: "Ýagty we tanyş", colors: ["#ff6b5f", "#f7c948", "#34d399"] },
-  { id: "sunset", name: "Gün ýaşmagy", description: "Ýyly reňkler", colors: ["#ff8b5e", "#ff4f8b", "#a855f7"] },
-  { id: "ocean", name: "Okean", description: "Sowuk tolkunlar", colors: ["#38bdf8", "#2dd4bf", "#6366f1"] },
-  { id: "neon", name: "Neon", description: "Gijeki şöhle", colors: ["#d946ef", "#22d3ee", "#a3e635"] },
+const GAME_THEMES: {
+  id: GameTheme;
+  name: string;
+  description: string;
+  colors: [string, string, string];
+}[] = [
+  {
+    id: "classic",
+    name: "Klassik",
+    description: "Ýagty we tanyş",
+    colors: ["#ff6b5f", "#f7c948", "#34d399"],
+  },
+  {
+    id: "sunset",
+    name: "Gün ýaşmagy",
+    description: "Ýyly reňkler",
+    colors: ["#ff8b5e", "#ff4f8b", "#a855f7"],
+  },
+  {
+    id: "ocean",
+    name: "Okean",
+    description: "Sowuk tolkunlar",
+    colors: ["#38bdf8", "#2dd4bf", "#6366f1"],
+  },
+  {
+    id: "neon",
+    name: "Neon",
+    description: "Gijeki şöhle",
+    colors: ["#d946ef", "#22d3ee", "#a3e635"],
+  },
 ];
 
 type DragGhost = {
@@ -134,7 +164,10 @@ function loadProfileStats(userId: string, best = 0): ProfileStats {
       games: Number.isFinite(parsed.games) && (parsed.games ?? 0) >= 0 ? parsed.games! : 0,
       lines: Number.isFinite(parsed.lines) && (parsed.lines ?? 0) >= 0 ? parsed.lines! : 0,
       combos: Number.isFinite(parsed.combos) && (parsed.combos ?? 0) >= 0 ? parsed.combos! : 0,
-      best: Math.max(best, Number.isFinite(parsed.best) && (parsed.best ?? 0) >= 0 ? parsed.best! : 0),
+      best: Math.max(
+        best,
+        Number.isFinite(parsed.best) && (parsed.best ?? 0) >= 0 ? parsed.best! : 0,
+      ),
     };
   } catch {
     return { ...emptyProfileStats(), best };
@@ -208,17 +241,12 @@ type SerializedPiece = {
   };
 };
 
-type SavedGame = {
-  board: Board;
-  pieces: (SerializedPiece | null)[];
-  score: number;
-};
-
 type UndoSnapshot = {
   board: Board;
   pieces: (Piece | null)[];
   score: number;
   profileStats: ProfileStats;
+  gameRun: SavedGameRun | null;
 };
 
 function colorClass(i: number) {
@@ -249,7 +277,6 @@ function hydratePiece(p: SerializedPiece): Piece {
   };
 }
 
-
 export default function BlockGame() {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [authReady, setAuthReady] = useState(false);
@@ -261,7 +288,7 @@ export default function BlockGame() {
   const [scoreAnimating, setScoreAnimating] = useState(false);
   const [best, setBest] = useState(0);
   const [dragGhost, setDragGhost] = useState<DragGhost | null>(null);
-  const [clearing, setClearing] = useState<Set<string>>(new Set());
+  const [clearing, setClearing] = useState<Set<number>>(new Set());
   const [shake, setShake] = useState(false);
   const [sound, setSound] = useState(true);
   const [paused, setPaused] = useState(false);
@@ -277,11 +304,17 @@ export default function BlockGame() {
   const [leaderboardCountdown, setLeaderboardCountdown] = useState(dailyCountdown);
   const [walletPoints, setWalletPoints] = useState(0);
   const [dailyTask, setDailyTask] = useState<DailyTask | null>(null);
+  const [dailyTaskCompleted, setDailyTaskCompleted] = useState(false);
+  const [runSubmissionStatus, setRunSubmissionStatus] = useState<
+    "idle" | "pending" | "failed" | "submitted"
+  >("idle");
   const [themeShopOpen, setThemeShopOpen] = useState(false);
   const [gameTheme, setGameTheme] = useState<GameTheme>(() => {
     if (typeof window === "undefined") return "classic";
     const savedTheme = window.localStorage.getItem(GAME_THEME_KEY);
-    return GAME_THEMES.some((item) => item.id === savedTheme) ? savedTheme as GameTheme : "classic";
+    return GAME_THEMES.some((item) => item.id === savedTheme)
+      ? (savedTheme as GameTheme)
+      : "classic";
   });
   const [comboBurst, setComboBurst] = useState<{ id: number; lines: number } | null>(null);
   const { isInstallable, install: installPWA } = usePWAInstall();
@@ -298,13 +331,18 @@ export default function BlockGame() {
   const comboBurstTimer = useRef(0);
   const comboBurstId = useRef(0);
   const pendingMoveTimer = useRef<number | null>(null);
-  const gameOverTimer = useRef<number | null>(null);
   const tutorialTimer = useRef(0);
   const userRef = useRef<AuthUser | null>(null);
-  const dailyTaskRef = useRef<DailyTask | null>(null);
-  const dailyTaskCompletionRequested = useRef(false);
+  const gameRunRef = useRef<SavedGameRun | null>(null);
+  const gameRandomRef = useRef<RandomSource | null>(null);
+  const moveInProgressRef = useRef(false);
+  const startGameInFlightRef = useRef(false);
+  const runSubmitInFlightRef = useRef(false);
+  const runSubmitRequestIdRef = useRef(0);
   userRef.current = user;
   boardLive.current = board;
+  const bestRef = useRef(best);
+  bestRef.current = best;
 
   const clearDrag = useCallback(() => {
     dragRef.current = null;
@@ -316,74 +354,160 @@ export default function BlockGame() {
     setDragGhost(null);
   }, []);
 
-  const loadUserProgress = useCallback(async (u: AuthUser) => {
-    const [bestScore, balance] = await Promise.all([loadBestScore(u.id), getWalletBalance(u.id)]);
-    setBest(bestScore);
-    setWalletPoints(balance);
-    setProfileStats(loadProfileStats(u.id, bestScore));
-    const savedGame = await loadGame(u.id);
-    setHasSave(!!savedGame);
-    setScore(0);
-    setUndoSnapshot(null);
-    setBoard(emptyBoard());
-    setPieces([null, null, null]);
-    setScreen("menu");
-    setPaused(false);
-    setTutorialStep(null);
-    clearDrag();
-    setPops([]);
-    dailyTaskRef.current = null;
-    dailyTaskCompletionRequested.current = false;
-    setDailyTask(null);
-    if (pendingMoveTimer.current !== null) window.clearTimeout(pendingMoveTimer.current);
-    if (gameOverTimer.current !== null) window.clearTimeout(gameOverTimer.current);
+  const loadUserProgress = useCallback(
+    async (u: AuthUser) => {
+      const [bestScore, balance] = await Promise.all([loadBestScore(u.id), getWalletBalance(u.id)]);
+      setBest(bestScore);
+      if (balance !== null) setWalletPoints(balance);
+      setProfileStats(loadProfileStats(u.id, bestScore));
+      const savedGame = await loadGame(u.id);
+      const restoredRun = savedGame?.gameRun ?? null;
+      const savedPieces =
+        savedGame?.pieces.map((piece) => (piece ? hydratePiece(piece) : null)) ?? [];
+      const terminalRun = !!(savedGame && restoredRun && !hasAnyMove(savedGame.board, savedPieces));
+      setHasSave(!!savedGame);
+      setScore(0);
+      setUndoSnapshot(null);
+      setBoard(emptyBoard());
+      setPieces([null, null, null]);
+      setScreen("menu");
+      setPaused(false);
+      setTutorialStep(null);
+      clearDrag();
+      setPops([]);
+      gameRunRef.current = terminalRun ? restoredRun : null;
+      gameRandomRef.current =
+        terminalRun && restoredRun
+          ? createSeededRandom(restoredRun.seed, restoredRun.randomState)
+          : null;
+      moveInProgressRef.current = false;
+      setRunSubmissionStatus(terminalRun ? "failed" : "idle");
+      setDailyTask(null);
+      setDailyTaskCompleted(false);
+      if (pendingMoveTimer.current !== null) window.clearTimeout(pendingMoveTimer.current);
 
-    void (async () => {
-      try {
-        const todayTask = await getTodayTask();
-        dailyTaskRef.current = todayTask;
-        setDailyTask(todayTask);
-      } catch (error) {
-        console.error('Error loading daily task:', error);
-      }
-    })();
-  }, [clearDrag]);
+      void (async () => {
+        try {
+          const todayTask = await getTodayTask();
+          setDailyTask(todayTask);
+          setDailyTaskCompleted(todayTask ? await hasCompletedDailyTask(todayTask.id) : false);
+        } catch (error) {
+          console.error("Error loading daily task:", error);
+        }
+      })();
+    },
+    [clearDrag],
+  );
 
   useEffect(() => {
+    let active = true;
     const initAuth = async () => {
-      const session = await getSessionUser();
-      setUser(session);
-      setSound(loadSoundPref());
-      if (session) {
+      try {
+        const session = await getSessionUser();
+        if (!active) return;
+        setUser(session);
+        setSound(loadSoundPref());
+        if (!session) return;
+
         await loadUserProgress(session);
-        setAuthReady(true);
+        if (!active) return;
         void prepareStartAd();
-        // Уведомления не должны задерживать или прерывать запуск игры.
+        // Notifications should not delay or interrupt startup.
         void (async () => {
           try {
             await initPushNotifications();
             await scheduleDailyReminder();
           } catch (error) {
-            console.error('Error initializing notifications:', error);
+            console.error("Error initializing notifications:", error);
           }
         })();
-        return;
+      } catch (error) {
+        console.error("Authentication initialization failed:", error);
+        if (active) setUser(null);
+      } finally {
+        if (active) setAuthReady(true);
       }
-      setAuthReady(true);
     };
-    initAuth();
+    void initAuth();
+    return () => {
+      active = false;
+    };
   }, [loadUserProgress]);
 
   useEffect(() => {
-    if (!user || typeof window === "undefined") return;
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((event) => {
+      if (event !== "SIGNED_OUT") return;
+      stopMenuMusic();
+      gameRunRef.current = null;
+      gameRandomRef.current = null;
+      moveInProgressRef.current = false;
+      runSubmitInFlightRef.current = false;
+      setUser(null);
+      setBest(0);
+      setWalletPoints(0);
+      setProfileStats(emptyProfileStats);
+      setDailyTask(null);
+      setDailyTaskCompleted(false);
+      setHasSave(false);
+      setRunSubmissionStatus("idle");
+      setUndoSnapshot(null);
+      setScreen("menu");
+    });
+    return () => subscription.unsubscribe();
+  }, []);
 
-    const syncProgress = () => {
-      void Promise.all([syncGame(user.id), syncBestScore(user.id)]);
+  useEffect(() => {
+    if (!user || typeof window === "undefined") return;
+    let active = true;
+
+    const syncProgress = async () => {
+      await syncGame(user.id);
+      const [nextBest, balance, latestSave] = await Promise.all([
+        loadBestScore(user.id),
+        getWalletBalance(user.id),
+        loadGame(user.id),
+      ]);
+      if (!active) return;
+      setBest(nextBest);
+      if (balance !== null) setWalletPoints(balance);
+      setHasSave(!!latestSave);
+      setProfileStats(loadProfileStats(user.id, nextBest));
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (
+        event.key === null ||
+        event.key === profileStatsKey(user.id) ||
+        event.key === `blockblast.best.v1:${user.id}`
+      ) {
+        setProfileStats(loadProfileStats(user.id, bestRef.current));
+      }
+      if (event.key === `blockblast.best.v1:${user.id}`) {
+        void loadBestScore(user.id).then(setBest);
+      }
+      if (
+        event.key === null ||
+        event.key === `blockblast.game.v1:${user.id}` ||
+        event.key === `blockblast.game-delete.v1:${user.id}`
+      ) {
+        void syncProgress();
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible" && navigator.onLine) void syncProgress();
     };
 
-    if (navigator.onLine) syncProgress();
+    if (navigator.onLine) void syncProgress();
     window.addEventListener("online", syncProgress);
-    return () => window.removeEventListener("online", syncProgress);
+    window.addEventListener("storage", onStorage);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      active = false;
+      window.removeEventListener("online", syncProgress);
+      window.removeEventListener("storage", onStorage);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
   }, [user]);
 
   useEffect(() => {
@@ -397,16 +521,33 @@ export default function BlockGame() {
 
   const handleAuth = (u: AuthUser) => {
     setUser(u);
-    loadUserProgress(u);
+    void loadUserProgress(u).catch((error: unknown) => {
+      console.error("Failed to load player progress:", error);
+    });
   };
 
-  const handleLogout = () => {
-    authLogout();
+  const handleLogout = async () => {
+    try {
+      await authLogout();
+    } catch (error) {
+      console.error("Sign-out failed:", error);
+      return;
+    }
     stopMenuMusic();
     setUser(null);
+    setBest(0);
+    setWalletPoints(0);
+    setProfileStats(emptyProfileStats);
+    setDailyTask(null);
+    setDailyTaskCompleted(false);
+    setHasSave(false);
+    setRunSubmissionStatus("idle");
     setUndoSnapshot(null);
+    gameRunRef.current = null;
+    gameRandomRef.current = null;
+    moveInProgressRef.current = false;
+    runSubmitInFlightRef.current = false;
     if (pendingMoveTimer.current !== null) window.clearTimeout(pendingMoveTimer.current);
-    if (gameOverTimer.current !== null) window.clearTimeout(gameOverTimer.current);
     setPaused(false);
     setTutorialStep(null);
     setScreen("menu");
@@ -442,14 +583,66 @@ export default function BlockGame() {
     return () => stopMenuMusic();
   }, [screen]);
 
-  const saveBest = useCallback(async (v: number) => {
+  const saveBest = useCallback((v: number) => {
     const u = userRef.current;
     if (!u) return;
-    setBest((prev) => {
-      const newBest = Math.max(prev, v);
-      saveBestScore(u.id, newBest);
-      return newBest;
-    });
+    saveBestScore(u.id, v);
+  }, []);
+
+  const submitCurrentRun = useCallback(async () => {
+    const currentRun = gameRunRef.current;
+    const submittingUser = userRef.current;
+    if (!currentRun || !submittingUser || runSubmitInFlightRef.current) return false;
+    runSubmitInFlightRef.current = true;
+    const requestId = ++runSubmitRequestIdRef.current;
+    setRunSubmissionStatus("pending");
+
+    try {
+      const result = await submitVerifiedGameRun(currentRun.runId, currentRun.moves);
+      if (!result) {
+        if (userRef.current?.id === submittingUser.id) setRunSubmissionStatus("failed");
+        return false;
+      }
+      if (userRef.current?.id !== submittingUser.id) return true;
+
+      const currentUser = submittingUser;
+      if (currentUser) {
+        saveBestScore(currentUser.id, result.bestScore);
+        setProfileStats((previous) => {
+          const next = { ...previous, best: Math.max(previous.best, result.score) };
+          saveProfileStats(currentUser.id, next);
+          return next;
+        });
+      }
+      setBest((previous) => Math.max(previous, result.bestScore));
+      if (currentUser) {
+        void getWalletBalance(currentUser.id).then((balance) => {
+          if (balance !== null) setWalletPoints(balance);
+        });
+        void getTodayTask().then(async (todayTask) => {
+          setDailyTask(todayTask);
+          setDailyTaskCompleted(todayTask ? await hasCompletedDailyTask(todayTask.id) : false);
+        });
+      }
+      if (result.rewardPoints > 0) {
+        void sendAchievementNotification(
+          "Задание выполнено!",
+          `В кошелёк начислено ${result.rewardPoints} очков!`,
+        );
+      }
+      if (currentUser && gameRunRef.current?.runId === currentRun.runId) {
+        await clearGameSave(currentUser.id);
+        setHasSave(false);
+      }
+      setRunSubmissionStatus("submitted");
+      return true;
+    } catch (error) {
+      console.error("Verified run submission failed:", error);
+      if (userRef.current?.id === submittingUser.id) setRunSubmissionStatus("failed");
+      return false;
+    } finally {
+      if (runSubmitRequestIdRef.current === requestId) runSubmitInFlightRef.current = false;
+    }
   }, []);
 
   const recordProfileMove = useCallback((lines: number, nextScore: number) => {
@@ -487,43 +680,46 @@ export default function BlockGame() {
     }, 1100);
   }, []);
 
-  const spawnParticles = useCallback((cells: { row: number; col: number; color: number }[], lines: number) => {
-    const el = boardRef.current;
-    if (!el) return;
-    const { rect, pad, cs } = boardMetrics(el);
-    const particleCount = Math.min(7, 3 + Math.max(0, lines - 1) * 2);
+  const spawnParticles = useCallback(
+    (cells: { row: number; col: number; color: number }[], lines: number) => {
+      const el = boardRef.current;
+      if (!el) return;
+      const { rect, pad, cs } = boardMetrics(el);
+      const particleCount = Math.min(7, 3 + Math.max(0, lines - 1) * 2);
 
-    const newParticles: Particle[] = cells.flatMap(({ row, col, color }) => {
-      const x = rect.left + pad + col * cs + cs / 2;
-      const y = rect.top + pad + row * cs + cs / 2;
+      const newParticles: Particle[] = cells.flatMap(({ row, col, color }) => {
+        const x = rect.left + pad + col * cs + cs / 2;
+        const y = rect.top + pad + row * cs + cs / 2;
 
-      return Array.from({ length: particleCount }, (_, i) => {
-        const angle = (i / particleCount) * Math.PI * 2 + Math.random() * 0.4;
-        const distance = 28 + Math.random() * 22;
-        const duration = 0.45 + Math.random() * 0.25;
-        return {
-          id: ++particleId.current,
-          x,
-          y,
-          color: `var(--b${color})`,
-          size: 3 + Math.random() * 3,
-          tx: Math.cos(angle) * distance,
-          ty: Math.sin(angle) * distance,
-          duration,
-        };
+        return Array.from({ length: particleCount }, (_, i) => {
+          const angle = (i / particleCount) * Math.PI * 2 + Math.random() * 0.4;
+          const distance = 28 + Math.random() * 22;
+          const duration = 0.45 + Math.random() * 0.25;
+          return {
+            id: ++particleId.current,
+            x,
+            y,
+            color: `var(--b${color})`,
+            size: 3 + Math.random() * 3,
+            tx: Math.cos(angle) * distance,
+            ty: Math.sin(angle) * distance,
+            duration,
+          };
+        });
       });
-    });
 
-    setParticles((prev) => {
-      const merged = [...prev, ...newParticles];
-      return merged.length > 72 ? merged.slice(merged.length - 72) : merged;
-    });
+      setParticles((prev) => {
+        const merged = [...prev, ...newParticles];
+        return merged.length > 72 ? merged.slice(merged.length - 72) : merged;
+      });
 
-    window.clearTimeout(particleClearTimer.current);
-    particleClearTimer.current = window.setTimeout(() => {
-      setParticles([]);
-    }, 750);
-  }, []);
+      window.clearTimeout(particleClearTimer.current);
+      particleClearTimer.current = window.setTimeout(() => {
+        setParticles([]);
+      }, 750);
+    },
+    [],
+  );
 
   const showComboBurst = useCallback((lines: number) => {
     window.clearTimeout(comboBurstTimer.current);
@@ -531,37 +727,55 @@ export default function BlockGame() {
     comboBurstTimer.current = window.setTimeout(() => setComboBurst(null), 780);
   }, []);
 
-  const beginFreshGame = useCallback(() => {
-    const u = userRef.current;
-    if (!u) return;
-    unlockAudio();
-    stopMenuMusic();
-    const nextBoard = emptyBoard();
-    const nextPieces = randomPieceSet();
-    setBoard(nextBoard);
-    setPieces(nextPieces);
-    setScore(0);
-    setProfileStats((prev) => {
-      const next = { ...prev, games: prev.games + 1 };
-      saveProfileStats(u.id, next);
-      return next;
-    });
-    setClearing(new Set());
-    clearDrag();
-    setPaused(false);
-    setPops([]);
-    setParticles([]);
-    setUndoSnapshot(null);
-    if (pendingMoveTimer.current !== null) window.clearTimeout(pendingMoveTimer.current);
-    if (gameOverTimer.current !== null) window.clearTimeout(gameOverTimer.current);
-    window.clearTimeout(tutorialTimer.current);
-    setTutorialStep(null);
-    setHasSave(false);
-    setScreen("game");
-    const serializedPieces = nextPieces.map((p) => (p ? serializePiece(p) : null));
-    void saveGame(u.id, { board: nextBoard, pieces: serializedPieces, score: 0 })
-      .then((saved) => setHasSave(saved));
-  }, [clearDrag]);
+  const beginFreshGame = useCallback(
+    (startedRun: StartedGameRun | null = null) => {
+      const u = userRef.current;
+      if (!u) return;
+      unlockAudio();
+      stopMenuMusic();
+      const nextBoard = emptyBoard();
+      const random = startedRun ? createSeededRandom(startedRun.seed) : null;
+      const nextPieces = randomPieceSet(3, 0, null, random ?? Math.random);
+      const gameRun: SavedGameRun | null =
+        startedRun && random
+          ? {
+              runId: startedRun.runId,
+              seed: startedRun.seed,
+              randomState: random.getState?.() ?? 0,
+              moves: [],
+            }
+          : null;
+      gameRunRef.current = gameRun;
+      gameRandomRef.current = random;
+      moveInProgressRef.current = false;
+      runSubmitInFlightRef.current = false;
+      setRunSubmissionStatus("idle");
+      setBoard(nextBoard);
+      setPieces(nextPieces);
+      setScore(0);
+      setProfileStats((prev) => {
+        const next = { ...prev, games: prev.games + 1 };
+        saveProfileStats(u.id, next);
+        return next;
+      });
+      setClearing(new Set());
+      clearDrag();
+      setPaused(false);
+      setPops([]);
+      setParticles([]);
+      setUndoSnapshot(null);
+      if (pendingMoveTimer.current !== null) window.clearTimeout(pendingMoveTimer.current);
+      window.clearTimeout(tutorialTimer.current);
+      setTutorialStep(null);
+      setHasSave(false);
+      setScreen("game");
+      const serializedPieces = nextPieces.map((p) => (p ? serializePiece(p) : null));
+      void saveGame(u.id, { board: nextBoard, pieces: serializedPieces, score: 0, gameRun }).then(
+        (saved) => setHasSave(saved),
+      );
+    },
+    [clearDrag],
+  );
 
   const continueGame = useCallback(async () => {
     const u = userRef.current;
@@ -570,9 +784,17 @@ export default function BlockGame() {
     if (!saved) return;
     unlockAudio();
     stopMenuMusic();
+    const restoredPieces = saved.pieces.map((piece) => (piece ? hydratePiece(piece) : null));
+    const gameOver = !hasAnyMove(saved.board, restoredPieces);
     setBoard(saved.board);
-    setPieces(saved.pieces.map((p) => (p ? hydratePiece(p) : null)));
+    setPieces(restoredPieces);
     setScore(saved.score);
+    gameRunRef.current = saved.gameRun ?? null;
+    gameRandomRef.current = saved.gameRun
+      ? createSeededRandom(saved.gameRun.seed, saved.gameRun.randomState)
+      : null;
+    moveInProgressRef.current = false;
+    setRunSubmissionStatus("idle");
     setClearing(new Set());
     clearDrag();
     setPaused(false);
@@ -580,16 +802,34 @@ export default function BlockGame() {
     setParticles([]);
     setUndoSnapshot(null);
     if (pendingMoveTimer.current !== null) window.clearTimeout(pendingMoveTimer.current);
-    if (gameOverTimer.current !== null) window.clearTimeout(gameOverTimer.current);
-    setScreen("game");
-  }, [clearDrag]);
+    setScreen(gameOver ? "over" : "game");
+    if (gameOver && saved.gameRun) void submitCurrentRun();
+  }, [clearDrag, submitCurrentRun]);
 
   const startGame = useCallback(async () => {
-    await showStartAd();
-    const seen = localStorage.getItem(TUTORIAL_KEY) === "1";
-    beginFreshGame();
-    if (!seen) setTutorialStep("drag");
-  }, [beginFreshGame]);
+    if (
+      startGameInFlightRef.current ||
+      runSubmissionStatus === "pending" ||
+      runSubmissionStatus === "failed"
+    ) {
+      return;
+    }
+    startGameInFlightRef.current = true;
+    try {
+      await showStartAd();
+      let seen = false;
+      try {
+        seen = localStorage.getItem(TUTORIAL_KEY) === "1";
+      } catch {
+        // The tutorial can be replayed when browser storage is unavailable.
+      }
+      const startedRun = await startVerifiedGameRun();
+      beginFreshGame(startedRun);
+      if (!seen) setTutorialStep("drag");
+    } finally {
+      startGameInFlightRef.current = false;
+    }
+  }, [beginFreshGame, runSubmissionStatus]);
 
   const pauseGame = () => {
     if (screen !== "game" || dragRef.current) return;
@@ -605,7 +845,6 @@ export default function BlockGame() {
     clearDrag();
     setUndoSnapshot(null);
     if (pendingMoveTimer.current !== null) window.clearTimeout(pendingMoveTimer.current);
-    if (gameOverTimer.current !== null) window.clearTimeout(gameOverTimer.current);
     if (u) {
       const saved = await loadGame(u.id);
       setHasSave(!!saved);
@@ -639,8 +878,7 @@ export default function BlockGame() {
     if (lines === 1) {
       buzz(50);
       if (sound) sfxSuccess();
-    }
-    else if (lines === 2) buzz([45, 25, 55, 25, 70]);
+    } else if (lines === 2) buzz([45, 25, 55, 25, 70]);
     else if (lines >= 3) buzz([70, 35, 85, 35, 105, 35, 130]);
   };
   const buzzInvalid = () => {
@@ -672,7 +910,7 @@ export default function BlockGame() {
   };
 
   const onPointerDown = (e: React.PointerEvent, slot: number) => {
-    if (paused || screen !== "game") return;
+    if (paused || screen !== "game" || moveInProgressRef.current) return;
     const piece = pieces[slot];
     if (!piece) return;
     unlockAudio();
@@ -720,49 +958,62 @@ export default function BlockGame() {
   };
 
   const afterMove = async (finalBoard: Board, usedSlot: number, nextScore: number) => {
-    const u = userRef.current;
-    if (!u) return;
-    setPieces((prev) => {
-      let rest: (Piece | null)[] = prev.map((p, i) => (i === usedSlot ? null : p));
-      if (rest.every((p) => p === null)) {
-        rest = randomPieceSet(3, nextScore);
-        sfxNewPieces();
-      }
-      const serializedPieces = rest.map((p) => (p ? serializePiece(p) : null));
-      saveGame(u.id, { board: finalBoard, pieces: serializedPieces, score: nextScore });
-      setHasSave(true);
-      gameOverTimer.current = window.setTimeout(() => {
-        gameOverTimer.current = null;
-        if (!hasAnyMove(finalBoard, rest)) {
-          sfxGameOver();
-          buzzGameOver();
-          setHasSave(false);
-          setScreen("over");
-          void clearGameSave(u.id);
-        }
-      }, 0);
-      return rest;
-    });
-
-    // Проверяем выполнение ежедневного задания
-    const todayTask = dailyTaskRef.current;
-    if (todayTask && nextScore >= todayTask.target_score && !dailyTaskCompletionRequested.current) {
-      dailyTaskCompletionRequested.current = true;
-      try {
-        const reward = await completeTask(todayTask.id);
-        if (reward === null) {
-          dailyTaskCompletionRequested.current = false;
-        } else if (reward > 0) {
-          setWalletPoints((current) => current + reward);
-          await sendAchievementNotification(
-            'Задание выполнено!',
-            `В кошелёк начислено ${reward} очков!`
-          );
-        }
-      } catch (error) {
-        console.error('Error checking task completion:', error);
-      }
+    const currentUser = userRef.current;
+    if (!currentUser) {
+      moveInProgressRef.current = false;
+      return;
     }
+
+    let remaining = pieces.map((piece, slot) => (slot === usedSlot ? null : piece));
+    if (remaining.every((piece) => piece === null)) {
+      const random = gameRandomRef.current;
+      remaining = randomPieceSet(3, nextScore, finalBoard, random ?? Math.random);
+      if (random && gameRunRef.current) {
+        gameRunRef.current = {
+          ...gameRunRef.current,
+          randomState: random.getState?.() ?? gameRunRef.current.randomState,
+        };
+      }
+      sfxNewPieces();
+    }
+
+    setPieces(remaining);
+    const gameOver = !hasAnyMove(finalBoard, remaining);
+    moveInProgressRef.current = false;
+
+    if (gameOver) {
+      setBest((previous) => Math.max(previous, nextScore));
+      sfxGameOver();
+      buzzGameOver();
+      setScreen("over");
+      const serializedPieces = remaining.map((piece) => (piece ? serializePiece(piece) : null));
+      const gameRun = gameRunRef.current;
+      if (gameRun) {
+        setHasSave(true);
+        const saved = await saveGame(currentUser.id, {
+          board: finalBoard,
+          pieces: serializedPieces,
+          score: nextScore,
+          gameRun,
+        });
+        setHasSave(saved);
+        void submitCurrentRun();
+      } else {
+        setHasSave(false);
+        void clearGameSave(currentUser.id);
+      }
+      return;
+    }
+
+    const serializedPieces = remaining.map((piece) => (piece ? serializePiece(piece) : null));
+    const gameRun = gameRunRef.current;
+    setHasSave(true);
+    void saveGame(currentUser.id, {
+      board: finalBoard,
+      pieces: serializedPieces,
+      score: nextScore,
+      gameRun,
+    });
   };
 
   const finishDrop = () => {
@@ -778,42 +1029,53 @@ export default function BlockGame() {
       return;
     }
     if (pendingMoveTimer.current !== null) window.clearTimeout(pendingMoveTimer.current);
-    if (gameOverTimer.current !== null) window.clearTimeout(gameOverTimer.current);
+    moveInProgressRef.current = true;
     setUndoSnapshot({
       board: boardLive.current,
       pieces: pieces.slice(),
       score,
       profileStats,
+      gameRun: gameRunRef.current,
     });
-    let next = place(boardLive.current, piece, target.row, target.col);
+    if (gameRunRef.current) {
+      gameRunRef.current = {
+        ...gameRunRef.current,
+        moves: [...gameRunRef.current.moves, { slot, row: target.row, col: target.col }],
+      };
+    }
+    const next = place(boardLive.current, piece, target.row, target.col);
     let gained = piece.shape.cells.length;
     const { rows, cols } = findClears(next);
     const lines = rows.length + cols.length;
     sfxPlace();
 
     if (tutorialStep === "drag") {
-      localStorage.setItem(TUTORIAL_KEY, "1");
+      try {
+        localStorage.setItem(TUTORIAL_KEY, "1");
+      } catch {
+        // Do not interrupt a valid move when browser storage is blocked.
+      }
       setTutorialStep("placed");
       window.clearTimeout(tutorialTimer.current);
       tutorialTimer.current = window.setTimeout(() => setTutorialStep(null), 1800);
     }
 
     if (lines > 0) {
-      const marks = new Set<string>();
+      const marks = new Set<number>();
       const clearedCells: { row: number; col: number; color: number }[] = [];
       rows.forEach((r) => {
         for (let c = 0; c < SIZE; c++) {
-          marks.add(`${r}-${c}`);
-          if (next[r][c] !== null) {
-            clearedCells.push({ row: r, col: c, color: next[r][c]! });
+          marks.add(r * SIZE + c);
+          if (next[r]![c] !== null) {
+            clearedCells.push({ row: r, col: c, color: next[r]![c]! });
           }
         }
       });
       cols.forEach((c) => {
         for (let r = 0; r < SIZE; r++) {
-          marks.add(`${r}-${c}`);
-          if (next[r][c] !== null) {
-            clearedCells.push({ row: r, col: c, color: next[r][c]! });
+          marks.add(r * SIZE + c);
+          if (next[r]![c] !== null) {
+            clearedCells.push({ row: r, col: c, color: next[r]![c]! });
           }
         }
       });
@@ -858,6 +1120,7 @@ export default function BlockGame() {
   };
 
   const undoLastMove = useCallback(() => {
+    if (runSubmissionStatus !== "idle") return;
     const snapshot = undoSnapshot;
     const u = userRef.current;
     if (!snapshot || !u) return;
@@ -865,14 +1128,16 @@ export default function BlockGame() {
       window.clearTimeout(pendingMoveTimer.current);
       pendingMoveTimer.current = null;
     }
-    if (gameOverTimer.current !== null) {
-      window.clearTimeout(gameOverTimer.current);
-      gameOverTimer.current = null;
-    }
     clearDrag();
     setBoard(snapshot.board);
     setPieces(snapshot.pieces);
     setScore(snapshot.score);
+    gameRunRef.current = snapshot.gameRun;
+    gameRandomRef.current = snapshot.gameRun
+      ? createSeededRandom(snapshot.gameRun.seed, snapshot.gameRun.randomState)
+      : null;
+    moveInProgressRef.current = false;
+    setRunSubmissionStatus("idle");
     setClearing(new Set());
     setPops([]);
     setParticles([]);
@@ -887,10 +1152,11 @@ export default function BlockGame() {
       board: snapshot.board,
       pieces: snapshot.pieces.map((p) => (p ? serializePiece(p) : null)),
       score: snapshot.score,
+      gameRun: snapshot.gameRun,
     });
     buzz(35);
     if (sound) sfxClick();
-  }, [clearDrag, profileStats, sound, undoSnapshot]);
+  }, [clearDrag, runSubmissionStatus, sound, undoSnapshot]);
 
   const share = async () => {
     const currentUser = userRef.current;
@@ -922,18 +1188,30 @@ export default function BlockGame() {
     }
   };
 
-  const ghost = new Set<string>();
-  if (dragGhost?.target && dragGhost.valid) {
-    dragGhost.piece.shape.cells.forEach(([r, c]) =>
-      ghost.add(`${dragGhost.target!.row + r}-${dragGhost.target!.col + c}`),
-    );
-  }
-  const badGhost = new Set<string>();
-  if (dragGhost?.target && !dragGhost.valid) {
-    dragGhost.piece.shape.cells.forEach(([r, c]) =>
-      badGhost.add(`${dragGhost.target!.row + r}-${dragGhost.target!.col + c}`),
-    );
-  }
+  const ghost = useMemo(() => {
+    const cells = new Set<number>();
+    const target = dragGhost?.target;
+    if (target && dragGhost.valid) {
+      dragGhost.piece.shape.cells.forEach(([r, c]) => {
+        const row = target.row + r;
+        const col = target.col + c;
+        if (row >= 0 && row < SIZE && col >= 0 && col < SIZE) cells.add(row * SIZE + col);
+      });
+    }
+    return cells;
+  }, [dragGhost]);
+  const badGhost = useMemo(() => {
+    const cells = new Set<number>();
+    const target = dragGhost?.target;
+    if (target && !dragGhost.valid) {
+      dragGhost.piece.shape.cells.forEach(([r, c]) => {
+        const row = target.row + r;
+        const col = target.col + c;
+        if (row >= 0 && row < SIZE && col >= 0 && col < SIZE) cells.add(row * SIZE + col);
+      });
+    }
+    return cells;
+  }, [dragGhost]);
 
   const diffLabel = screen === "game" ? difficultyLabel(score) : null;
   const dragUnit = metricsCache.current?.cs ?? 40;
@@ -963,15 +1241,25 @@ export default function BlockGame() {
     >
       <header className="grid shrink-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
         <div className="min-w-0">
-          <p className="text-[11px] font-bold uppercase tracking-[0.22em] text-muted-foreground">Hasap</p>
-          <p className={`score-hero text-5xl font-semibold leading-none text-foreground tabular-nums ${scoreAnimating ? 'animate-score-pop' : ''}`}>{score}</p>
+          <p className="text-[11px] font-bold uppercase tracking-[0.22em] text-muted-foreground">
+            Hasap
+          </p>
+          <p
+            className={`score-hero text-5xl font-semibold leading-none text-foreground tabular-nums ${scoreAnimating ? "animate-score-pop" : ""}`}
+          >
+            {score}
+          </p>
           {diffLabel && (
-            <p className="mt-1.5 text-[10px] font-bold uppercase tracking-[0.18em] text-primary">{diffLabel}</p>
+            <p className="mt-1.5 text-[10px] font-bold uppercase tracking-[0.18em] text-primary">
+              {diffLabel}
+            </p>
           )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
           <div className="best-chip">
-            <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-muted-foreground">Rekord</p>
+            <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-muted-foreground">
+              Rekord
+            </p>
             <p className="font-display text-lg font-semibold tabular-nums text-foreground">
               {Math.max(best, score)}
             </p>
@@ -982,8 +1270,11 @@ export default function BlockGame() {
                 type="button"
                 aria-label="Soňky ädimi yzyna al"
                 title="Soňky ädimi yzyna al"
-                disabled={!undoSnapshot}
-                onClick={() => { undoLastMove(); sfxButton(); }}
+                disabled={!undoSnapshot || runSubmissionStatus !== "idle"}
+                onClick={() => {
+                  undoLastMove();
+                  sfxButton();
+                }}
                 onMouseEnter={handleButtonHover}
                 className={`icon-btn relative z-30 ${!undoSnapshot ? "opacity-35" : ""}`}
               >
@@ -992,7 +1283,10 @@ export default function BlockGame() {
               <button
                 type="button"
                 aria-label="Sež"
-                onClick={() => { pauseGame(); sfxButton(); }}
+                onClick={() => {
+                  pauseGame();
+                  sfxButton();
+                }}
                 onMouseEnter={handleButtonHover}
                 className="icon-btn relative z-30"
               >
@@ -1003,7 +1297,10 @@ export default function BlockGame() {
           <button
             type="button"
             aria-label={sound ? "Sesi öçürmek" : "Ses açmak"}
-            onClick={() => { toggleSound(); sfxButton(); }}
+            onClick={() => {
+              toggleSound();
+              sfxButton();
+            }}
             onMouseEnter={handleButtonHover}
             className="icon-btn relative z-30"
           >
@@ -1023,11 +1320,19 @@ export default function BlockGame() {
         >
           {board.map((row, r) =>
             row.map((cell, c) => {
-              const key = `${r}-${c}`;
-              const isClearing = clearing.has(key);
-              const isGhost = ghost.has(key);
-              const isBad = badGhost.has(key);
-              return <BoardCell key={key} cell={cell} isClearing={isClearing} isGhost={isGhost} isBad={isBad} />;
+              const cellIndex = r * SIZE + c;
+              const isClearing = clearing.has(cellIndex);
+              const isGhost = ghost.has(cellIndex);
+              const isBad = badGhost.has(cellIndex);
+              return (
+                <BoardCell
+                  key={cellIndex}
+                  cell={cell}
+                  isClearing={isClearing}
+                  isGhost={isGhost}
+                  isBad={isBad}
+                />
+              );
             }),
           )}
         </div>
@@ -1036,7 +1341,9 @@ export default function BlockGame() {
       <div className="tray-rail mt-auto shrink-0 pt-6">
         {pieces.map((p, i) => (
           <div key={i} className="tray-slot" onPointerDown={(e) => onPointerDown(e, i)}>
-            {p && dragGhost?.slot !== i && <PieceView piece={p} unit={20} className="animate-piece-in" />}
+            {p && dragGhost?.slot !== i && (
+              <PieceView piece={p} unit={20} className="animate-piece-in" />
+            )}
           </div>
         ))}
       </div>
@@ -1070,29 +1377,33 @@ export default function BlockGame() {
         <div
           key={p.id}
           className="particle"
-          style={{
-            left: p.x,
-            top: p.y,
-            width: p.size,
-            height: p.size,
-            background: p.color,
-            '--tx': `${p.tx}px`,
-            '--ty': `${p.ty}px`,
-            '--duration': `${p.duration}s`,
-          } as React.CSSProperties}
+          style={
+            {
+              left: p.x,
+              top: p.y,
+              width: p.size,
+              height: p.size,
+              background: p.color,
+              "--tx": `${p.tx}px`,
+              "--ty": `${p.ty}px`,
+              "--duration": `${p.duration}s`,
+            } as React.CSSProperties
+          }
         />
       ))}
 
       {comboBurst && (
-        <div key={comboBurst.id} className={`combo-burst combo-burst-${Math.min(comboBurst.lines, 4)}`} aria-live="polite">
+        <div
+          key={comboBurst.id}
+          className={`combo-burst combo-burst-${Math.min(comboBurst.lines, 4)}`}
+          aria-live="polite"
+        >
           <span>COMBO</span>
           <strong>x{comboBurst.lines}</strong>
         </div>
       )}
 
-      {tutorialStep && screen === "game" && !paused && (
-        <TutorialCoach step={tutorialStep} />
-      )}
+      {tutorialStep && screen === "game" && !paused && <TutorialCoach step={tutorialStep} />}
 
       {screen === "menu" && !themeShopOpen && (
         <Overlay className="animate-screen-transition">
@@ -1100,7 +1411,9 @@ export default function BlockGame() {
             BLOCK
             <span className="text-primary"> BLAST</span>
           </p>
-          <p className="mt-4 text-sm font-semibold text-muted-foreground">Setirleri ýygyn, bloklary partlat</p>
+          <p className="mt-4 text-sm font-semibold text-muted-foreground">
+            Setirleri ýygyn, bloklary partlat
+          </p>
           <p className="mt-6 text-sm font-bold text-foreground">Salam, {user.name}!</p>
           <p className="mt-1 text-xs text-muted-foreground">ID: {user.id.slice(0, 8)}...</p>
           <p className="mt-2 font-display text-base font-semibold tabular-nums text-foreground/80">
@@ -1108,33 +1421,60 @@ export default function BlockGame() {
           </p>
           {hasSave ? (
             <>
-              <button className="btn-primary btn-pulse mt-8" onClick={() => { continueGame(); sfxButton(); }}>
+              <button
+                className="btn-primary btn-pulse mt-8"
+                onClick={() => {
+                  continueGame();
+                  sfxButton();
+                }}
+              >
                 Dowam et
               </button>
-              <button className="btn-ghost mt-3" onClick={() => { startGame(); sfxButton(); }}>
+              <button
+                className="btn-ghost mt-3"
+                onClick={() => {
+                  startGame();
+                  sfxButton();
+                }}
+              >
                 Täze oýun
               </button>
             </>
           ) : (
-            <button className="btn-primary btn-pulse mt-8" onClick={() => { startGame(); sfxButton(); }}>
+            <button
+              className="btn-primary btn-pulse mt-8"
+              onClick={() => {
+                startGame();
+                sfxButton();
+              }}
+            >
               Oýnamak
             </button>
           )}
           <button
             className="mt-5 text-sm font-semibold text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
-            onClick={() => { showLeaderboard(); sfxButton(); }}
+            onClick={() => {
+              showLeaderboard();
+              sfxButton();
+            }}
           >
             Reýting
           </button>
           <button
             className="mt-3 text-sm font-semibold text-primary underline-offset-4 hover:text-primary/80 hover:underline"
-            onClick={() => { openProfile(); sfxButton(); }}
+            onClick={() => {
+              openProfile();
+              sfxButton();
+            }}
           >
             Profil
           </button>
           <button
             className="mt-3 text-sm font-semibold text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
-            onClick={() => { setThemeShopOpen(true); sfxButton(); }}
+            onClick={() => {
+              setThemeShopOpen(true);
+              sfxButton();
+            }}
           >
             Temalar dükany
           </button>
@@ -1169,7 +1509,9 @@ export default function BlockGame() {
                 onClick={() => selectGameTheme(item.id)}
               >
                 <span className="theme-preview" aria-hidden>
-                  {item.colors.map((color) => <i key={color} style={{ backgroundColor: color }} />)}
+                  {item.colors.map((color) => (
+                    <i key={color} style={{ backgroundColor: color }} />
+                  ))}
                 </span>
                 <span className="theme-card-copy">
                   <strong>{item.name}</strong>
@@ -1179,7 +1521,13 @@ export default function BlockGame() {
               </button>
             ))}
           </div>
-          <button className="btn-primary mt-7" onClick={() => { setThemeShopOpen(false); sfxButton(); }}>
+          <button
+            className="btn-primary mt-7"
+            onClick={() => {
+              setThemeShopOpen(false);
+              sfxButton();
+            }}
+          >
             Taýýar
           </button>
         </Overlay>
@@ -1188,22 +1536,74 @@ export default function BlockGame() {
       {screen === "over" && (
         <Overlay className="animate-screen-transition">
           <h2 className="font-display text-3xl font-semibold text-foreground">Oýun gutardy</h2>
-          <p className="score-hero mt-6 text-6xl font-semibold tabular-nums text-primary">{score}</p>
+          <p className="score-hero mt-6 text-6xl font-semibold tabular-nums text-primary">
+            {score}
+          </p>
           <p className="mt-2 text-sm font-semibold text-muted-foreground">
             Rekord · {Math.max(best, score)}
           </p>
-          <button className="btn-primary btn-pulse mt-8" onClick={() => { startGame(); sfxButton(); }}>
+          {runSubmissionStatus === "pending" && (
+            <p className="mt-3 text-sm text-muted-foreground" role="status">
+              Netije barlanýar…
+            </p>
+          )}
+          {runSubmissionStatus === "submitted" && (
+            <p className="mt-3 text-sm text-primary" role="status">
+              Netije tassyklanyldy
+            </p>
+          )}
+          {runSubmissionStatus === "failed" && (
+            <>
+              <p className="mt-3 text-sm text-destructive" role="alert">
+                Netijäni ibermek başartmady. Interneti barlaň.
+              </p>
+              <button
+                className="btn-ghost mt-2"
+                onClick={() => {
+                  void submitCurrentRun();
+                }}
+              >
+                Gaýtadan ibermek
+              </button>
+            </>
+          )}
+          <button
+            className="btn-primary btn-pulse mt-8"
+            disabled={runSubmissionStatus === "pending" || runSubmissionStatus === "failed"}
+            onClick={() => {
+              startGame();
+              sfxButton();
+            }}
+          >
             Gaýtadan oýnamak
           </button>
-          {undoSnapshot && (
-            <button className="btn-ghost mt-3" onClick={() => { undoLastMove(); sfxButton(); }}>
+          {undoSnapshot && runSubmissionStatus === "idle" && (
+            <button
+              className="btn-ghost mt-3"
+              onClick={() => {
+                undoLastMove();
+                sfxButton();
+              }}
+            >
               Soňky ädimi yzyna al
             </button>
           )}
-          <button className="btn-ghost mt-3" onClick={() => { share(); sfxButton(); }}>
+          <button
+            className="btn-ghost mt-3"
+            onClick={() => {
+              share();
+              sfxButton();
+            }}
+          >
             Netijäni paýlaşmak
           </button>
-          <button className="btn-ghost mt-3" onClick={() => { quitToMenu(); sfxButton(); }}>
+          <button
+            className="btn-ghost mt-3"
+            onClick={() => {
+              quitToMenu();
+              sfxButton();
+            }}
+          >
             Menýu
           </button>
         </Overlay>
@@ -1211,52 +1611,99 @@ export default function BlockGame() {
 
       {screen === "profile" && (
         <Overlay>
-          <p className="text-xs font-bold uppercase tracking-[0.2em] text-primary">Oýunçy profili</p>
+          <p className="text-xs font-bold uppercase tracking-[0.2em] text-primary">
+            Oýunçy profili
+          </p>
           <h2 className="mt-2 font-display text-3xl font-semibold text-foreground">{user.name}</h2>
           <p className="mt-2 text-sm text-muted-foreground">{formatPhoneDisplay(user.phone)}</p>
           <div className="mt-6 w-full max-w-xs rounded-2xl bg-primary/10 p-4 text-center">
-            <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-muted-foreground">Gapjyk</p>
-            <p className="mt-1 font-display text-4xl font-semibold tabular-nums text-primary">{walletPoints}</p>
+            <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-muted-foreground">
+              Gapjyk
+            </p>
+            <p className="mt-1 font-display text-4xl font-semibold tabular-nums text-primary">
+              {walletPoints}
+            </p>
             <p className="mt-1 text-xs font-semibold text-foreground/80">Gapjykdaky oçko</p>
           </div>
           {dailyTask && (
             <div className="mt-3 w-full max-w-xs rounded-2xl bg-card/70 p-4 text-left">
               <div className="flex items-start justify-between gap-3">
                 <div>
-                  <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-muted-foreground">Soňky ýumuş</p>
+                  <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-muted-foreground">
+                    Soňky ýumuş
+                  </p>
                   <p className="mt-1 text-sm font-semibold text-foreground">{dailyTask.title}</p>
                   <p className="mt-1 text-xs text-muted-foreground">{dailyTask.description}</p>
+                  <p
+                    className={`mt-2 text-xs font-semibold ${dailyTaskCompleted ? "text-primary" : "text-muted-foreground"}`}
+                  >
+                    {dailyTaskCompleted
+                      ? "Ýumuş ýerine ýetirildi"
+                      : "Baýragy almak üçin maksada ýetiriň"}
+                  </p>
                 </div>
-                <span className="shrink-0 rounded-full bg-primary/15 px-2.5 py-1 text-sm font-bold text-primary">+{dailyTask.reward_points}</span>
+                <span className="shrink-0 rounded-full bg-primary/15 px-2.5 py-1 text-sm font-bold text-primary">
+                  +{dailyTask.reward_points}
+                </span>
               </div>
             </div>
           )}
           <div className="mt-7 grid w-full max-w-xs grid-cols-2 gap-3">
             <div className="rounded-2xl bg-card/70 p-4 text-center">
-              <p className="text-2xl font-display font-semibold tabular-nums text-primary">{profileStats.best}</p>
-              <p className="mt-1 text-[10px] font-bold uppercase tracking-[0.16em] text-muted-foreground">Rekord</p>
+              <p className="text-2xl font-display font-semibold tabular-nums text-primary">
+                {profileStats.best}
+              </p>
+              <p className="mt-1 text-[10px] font-bold uppercase tracking-[0.16em] text-muted-foreground">
+                Rekord
+              </p>
             </div>
             <div className="rounded-2xl bg-card/70 p-4 text-center">
-              <p className="text-2xl font-display font-semibold tabular-nums text-primary">{profileStats.games}</p>
-              <p className="mt-1 text-[10px] font-bold uppercase tracking-[0.16em] text-muted-foreground">Oýunlar</p>
+              <p className="text-2xl font-display font-semibold tabular-nums text-primary">
+                {profileStats.games}
+              </p>
+              <p className="mt-1 text-[10px] font-bold uppercase tracking-[0.16em] text-muted-foreground">
+                Oýunlar
+              </p>
             </div>
             <div className="rounded-2xl bg-card/70 p-4 text-center">
-              <p className="text-2xl font-display font-semibold tabular-nums text-primary">{profileStats.lines}</p>
-              <p className="mt-1 text-[10px] font-bold uppercase tracking-[0.16em] text-muted-foreground">Setirler</p>
+              <p className="text-2xl font-display font-semibold tabular-nums text-primary">
+                {profileStats.lines}
+              </p>
+              <p className="mt-1 text-[10px] font-bold uppercase tracking-[0.16em] text-muted-foreground">
+                Setirler
+              </p>
             </div>
             <div className="rounded-2xl bg-card/70 p-4 text-center">
-              <p className="text-2xl font-display font-semibold tabular-nums text-primary">{profileStats.combos}</p>
-              <p className="mt-1 text-[10px] font-bold uppercase tracking-[0.16em] text-muted-foreground">Kombo</p>
+              <p className="text-2xl font-display font-semibold tabular-nums text-primary">
+                {profileStats.combos}
+              </p>
+              <p className="mt-1 text-[10px] font-bold uppercase tracking-[0.16em] text-muted-foreground">
+                Kombo
+              </p>
             </div>
           </div>
           <div className="mt-6 w-full rounded-2xl bg-card/70 p-4 text-left">
-            <p className="text-xs font-bold uppercase tracking-[0.16em] text-muted-foreground">Siziň referral linkiňiz</p>
+            <p className="text-xs font-bold uppercase tracking-[0.16em] text-muted-foreground">
+              Siziň referral linkiňiz
+            </p>
             <p className="mt-2 break-all text-sm font-semibold text-foreground">{referralLink}</p>
-            <button className="btn-primary mt-4 w-full" onClick={() => { copyReferralLink(); sfxButton(); }}>
+            <button
+              className="btn-primary mt-4 w-full"
+              onClick={() => {
+                copyReferralLink();
+                sfxButton();
+              }}
+            >
               {profileCopied ? "Göçürildi" : "Linki göçür"}
             </button>
           </div>
-          <button className="btn-ghost mt-4" onClick={() => { setScreen("menu"); sfxButton(); }}>
+          <button
+            className="btn-ghost mt-4"
+            onClick={() => {
+              setScreen("menu");
+              sfxButton();
+            }}
+          >
             Menýu
           </button>
         </Overlay>
@@ -1265,8 +1712,12 @@ export default function BlockGame() {
       {screen === "leaderboard" && (
         <Overlay className="animate-screen-transition">
           <div className="mb-3 rounded-2xl bg-primary/10 px-5 py-3 text-center">
-            <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-muted-foreground">24 sagat galýar</p>
-            <p className="mt-1 font-display text-2xl font-semibold tabular-nums text-primary">{leaderboardCountdown}</p>
+            <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-muted-foreground">
+              24 sagat galýar
+            </p>
+            <p className="mt-1 font-display text-2xl font-semibold tabular-nums text-primary">
+              {leaderboardCountdown}
+            </p>
           </div>
           <h2 className="font-display text-3xl font-semibold text-foreground">Reýting</h2>
           {leaderboardLoading ? (
@@ -1281,7 +1732,7 @@ export default function BlockGame() {
                     <div
                       key={`${entry.name}-${entry.score}-${index}`}
                       className={`flex items-center justify-between rounded-lg p-3 ${
-                        index === 0 ? 'bg-primary/10' : 'bg-[oklch(0.18_0.02_240_/_30%)]'
+                        index === 0 ? "bg-primary/10" : "bg-[oklch(0.18_0.02_240_/_30%)]"
                       }`}
                     >
                       <div className="flex items-center gap-3">
@@ -1301,7 +1752,13 @@ export default function BlockGame() {
               )}
             </div>
           )}
-          <button className="btn-primary mt-6" onClick={() => { setScreen('menu'); sfxButton(); }}>
+          <button
+            className="btn-primary mt-6"
+            onClick={() => {
+              setScreen("menu");
+              sfxButton();
+            }}
+          >
             Menýu
           </button>
         </Overlay>
@@ -1310,10 +1767,22 @@ export default function BlockGame() {
       {paused && screen === "game" && (
         <Overlay>
           <h2 className="font-display text-3xl font-semibold text-foreground">Sež</h2>
-          <button className="btn-primary btn-pulse mt-8" onClick={() => { resumeGame(); sfxButton(); }}>
+          <button
+            className="btn-primary btn-pulse mt-8"
+            onClick={() => {
+              resumeGame();
+              sfxButton();
+            }}
+          >
             Dowam et
           </button>
-          <button className="btn-ghost mt-3" onClick={() => { quitToMenu(); sfxButton(); }}>
+          <button
+            className="btn-ghost mt-3"
+            onClick={() => {
+              quitToMenu();
+              sfxButton();
+            }}
+          >
             Menýu
           </button>
         </Overlay>
@@ -1322,9 +1791,11 @@ export default function BlockGame() {
   );
 }
 
-function Overlay({ children }: { children: React.ReactNode }) {
+function Overlay({ children, className = "" }: { children: React.ReactNode; className?: string }) {
   return (
-    <div className="animate-fade-in fixed inset-0 z-20 flex flex-col items-center justify-center bg-[var(--overlay)] px-8 text-center">
+    <div
+      className={`animate-fade-in fixed inset-0 z-20 flex flex-col items-center justify-center bg-[var(--overlay)] px-8 text-center ${className}`}
+    >
       <div className="overlay-panel flex w-full max-w-sm flex-col items-center">{children}</div>
     </div>
   );
@@ -1334,12 +1805,19 @@ function TutorialCoach({ step }: { step: Exclude<TutorialStep, null> }) {
   const placed = step === "placed";
 
   return (
-    <aside className={`tutorial-coach ${placed ? "tutorial-coach-success" : ""}`} aria-live="polite">
-      <span className="tutorial-coach-icon" aria-hidden>{placed ? "✓" : "↓"}</span>
+    <aside
+      className={`tutorial-coach ${placed ? "tutorial-coach-success" : ""}`}
+      aria-live="polite"
+    >
+      <span className="tutorial-coach-icon" aria-hidden>
+        {placed ? "✓" : "↓"}
+      </span>
       <div>
         <p className="tutorial-coach-title">{placed ? "Отлично!" : "Ваш первый ход"}</p>
         <p className="tutorial-coach-text">
-          {placed ? "Продолжайте заполнять ряды и столбцы." : "Перетащите любую фигуру из нижней панели на поле."}
+          {placed
+            ? "Продолжайте заполнять ряды и столбцы."
+            : "Перетащите любую фигуру из нижней панели на поле."}
         </p>
       </div>
     </aside>
@@ -1361,8 +1839,13 @@ function LoadingScreen() {
           <span className="loading-block loading-block-c6" />
         </div>
         <p className="loading-kicker">BLOCK BLAST</p>
-        <h1 className="loading-title">Ready for a<br /><span>bright move?</span></h1>
-        <div className="loading-progress" aria-hidden><span /></div>
+        <h1 className="loading-title">
+          Ready for a<br />
+          <span>bright move?</span>
+        </h1>
+        <div className="loading-progress" aria-hidden>
+          <span />
+        </div>
         <p className="loading-label">Loading game</p>
       </div>
     </main>
@@ -1381,8 +1864,19 @@ function IconPause() {
 function IconUndo() {
   return (
     <svg width="19" height="19" viewBox="0 0 24 24" fill="none" aria-hidden>
-      <path d="M9 8 4 12l5 4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-      <path d="M5 12h8a5 5 0 1 1 0 10h-1" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+      <path
+        d="M9 8 4 12l5 4"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M5 12h8a5 5 0 1 1 0 10h-1"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+      />
     </svg>
   );
 }
@@ -1411,12 +1905,25 @@ function IconSoundOff() {
         d="M4 10v4a1 1 0 0 0 1 1h2.4l3.3 2.6a1 1 0 0 0 1.6-.8V7.2a1 1 0 0 0-1.6-.8L7.4 9H5a1 1 0 0 0-1 1Z"
         fill="currentColor"
       />
-      <path d="M16 9.5 20.5 14M20.5 9.5 16 14" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+      <path
+        d="M16 9.5 20.5 14M20.5 9.5 16 14"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+      />
     </svg>
   );
 }
 
-const PieceView = memo(function PieceView({ piece, unit, className = "" }: { piece: Piece; unit: number; className?: string }) {
+const PieceView = memo(function PieceView({
+  piece,
+  unit,
+  className = "",
+}: {
+  piece: Piece;
+  unit: number;
+  className?: string;
+}) {
   return (
     <div
       className={`relative ${className}`}

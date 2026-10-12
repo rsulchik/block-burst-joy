@@ -1,0 +1,7 @@
+project_id = "block-burst-joy"
+
+[api]
+enabled = true
+
+[functions.submit-game-run]
+verify_jwt = true

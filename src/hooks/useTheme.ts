@@ -1,43 +1,44 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState } from "react";
 
-type Theme = 'light' | 'dark' | 'system';
+type Theme = "light" | "dark" | "system";
 
-const THEME_KEY = 'blockblast_theme';
+const THEME_KEY = "blockblast_theme";
 
 export function useTheme() {
   const [theme, setThemeState] = useState<Theme>(() => {
-    if (typeof window === 'undefined') return 'system';
-    return (localStorage.getItem(THEME_KEY) as Theme) || 'system';
+    if (typeof window === "undefined") return "system";
+    return (localStorage.getItem(THEME_KEY) as Theme) || "system";
   });
 
-  const [actualTheme, setActualTheme] = useState<'light' | 'dark'>(() => {
-    if (typeof window === 'undefined') return 'dark';
+  const [actualTheme, setActualTheme] = useState<"light" | "dark">(() => {
+    if (typeof window === "undefined") return "dark";
     const stored = localStorage.getItem(THEME_KEY) as Theme;
-    if (stored === 'light' || stored === 'dark') return stored;
-    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    if (stored === "light" || stored === "dark") return stored;
+    return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
   });
 
   useEffect(() => {
     const root = document.documentElement;
-    
-    const applyTheme = (newTheme: 'light' | 'dark') => {
-      root.classList.remove('light', 'dark');
+
+    const applyTheme = (newTheme: "light" | "dark") => {
+      root.classList.remove("light", "dark");
       root.classList.add(newTheme);
       setActualTheme(newTheme);
     };
 
-    if (theme === 'system') {
-      const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
-      applyTheme(mediaQuery.matches ? 'dark' : 'light');
+    if (theme === "system") {
+      const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+      applyTheme(mediaQuery.matches ? "dark" : "light");
 
       const handler = (e: MediaQueryListEvent) => {
-        applyTheme(e.matches ? 'dark' : 'light');
+        applyTheme(e.matches ? "dark" : "light");
       };
 
-      mediaQuery.addEventListener('change', handler);
-      return () => mediaQuery.removeEventListener('change', handler);
+      mediaQuery.addEventListener("change", handler);
+      return () => mediaQuery.removeEventListener("change", handler);
     } else {
       applyTheme(theme);
+      return undefined;
     }
   }, [theme]);
 
@@ -47,9 +48,9 @@ export function useTheme() {
   };
 
   const toggleTheme = () => {
-    if (theme === 'light') setTheme('dark');
-    else if (theme === 'dark') setTheme('light');
-    else setTheme(actualTheme === 'light' ? 'dark' : 'light');
+    if (theme === "light") setTheme("dark");
+    else if (theme === "dark") setTheme("light");
+    else setTheme(actualTheme === "light" ? "dark" : "light");
   };
 
   return { theme, actualTheme, setTheme, toggleTheme };
