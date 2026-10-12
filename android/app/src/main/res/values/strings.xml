@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Block Blast</string>
+    <string name="title_activity_main">Block Blast</string>
+    <string name="package_name">com.blockblast.joy</string>
+    <string name="custom_url_scheme">com.blockblast.joy</string>
+</resources>

@@ -1,0 +1,21 @@
+include ':app'
+include ':capacitor-cordova-android-plugins'
+project(':capacitor-cordova-android-plugins').projectDir = new File('./capacitor-cordova-android-plugins/')
+
+// Capacitor projects declare their own repositories. Add the working mirror
+// before each project is evaluated so Android and Firebase dependencies can be
+// resolved on networks where Google Maven responds with 404.
+gradle.beforeProject { project ->
+    project.buildscript.repositories {
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        mavenCentral()
+        maven { url 'https://maven.aliyun.com/repository/central' }
+    }
+    project.repositories {
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        mavenCentral()
+        maven { url 'https://maven.aliyun.com/repository/central' }
+    }
+}
+
+apply from: 'capacitor.settings.gradle'

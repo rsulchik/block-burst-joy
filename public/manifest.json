@@ -1,0 +1,40 @@
+{
+  "name": "Block Blast Joy",
+  "short_name": "Block Blast",
+  "description": "Мобильная игра-головоломка в стиле Block Blast",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#1a2030",
+  "theme_color": "#1a2030",
+  "orientation": "portrait",
+  "scope": "/",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["games", "puzzle"],
+  "shortcuts": [
+    {
+      "name": "Новая игра",
+      "short_name": "Играть",
+      "description": "Начать новую игру",
+      "url": "/",
+      "icons": [
+        {
+          "src": "/icon-192.png",
+          "sizes": "192x192"
+        }
+      ]
+    }
+  ]
+}
